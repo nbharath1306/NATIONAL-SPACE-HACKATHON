@@ -1,0 +1,504 @@
+================================================================================
+   AUTONOMOUS CONSTELLATION MANAGER (ACM) — FULL CODEBASE & PROBLEM REPORT
+   National Space Hackathon 2026 | IIT Delhi
+================================================================================
+
+Generated: 2026-03-26
+
+================================================================================
+1. PROBLEM STATEMENT SUMMARY (from NSH_PS.pdf)
+================================================================================
+
+The hackathon requires building an Autonomous Constellation Manager (ACM) — a
+backend system acting as the "brain" for 50+ LEO satellites navigating through
+tens of thousands of tracked debris fragments.
+
+CORE OBJECTIVES:
+  1. High-Frequency Telemetry Ingestion — ECI state vectors (position + velocity)
+  2. Predictive Conjunction Assessment — forecast collisions up to 24 hours ahead
+     using efficient spatial indexing (NOT O(N²) brute force)
+  3. Autonomous Collision Avoidance (COLA) — auto-schedule evasion when miss
+     distance < 100 meters
+  4. Station-Keeping & Recovery — return satellites to 10 km bounding box
+  5. Propellant Budgeting & EOL — Tsiolkovsky fuel tracking, graveyard orbit at 5%
+  6. Multi-Objective Optimization — maximize uptime, minimize fuel expenditure
+
+PHYSICS REQUIREMENTS:
+  - ECI (J2000) coordinate system
+  - J2 perturbation model (not simple Keplerian)
+  - RK4 numerical integration
+  - RTN frame for maneuver planning
+  - Constants: mu=398600.4418, RE=6378.137, J2=1.08263e-3
+
+API REQUIREMENTS (RESTful on port 8000):
+  - POST /api/telemetry           — ingest state vectors
+  - POST /api/maneuver/schedule   — schedule burn sequences
+  - POST /api/simulate/step       — advance simulation clock
+  - GET  /api/visualization/snapshot — compact data for frontend
+
+SPACECRAFT CONSTANTS:
+  - Dry Mass: 500.0 kg
+  - Initial Fuel: 50.0 kg (total wet mass = 550 kg)
+  - Specific Impulse (Isp): 300.0 s
+  - Max Delta-V per burn: 15.0 m/s
+  - Thruster Cooldown: 600 seconds between burns
+  - Collision Threshold: 100 meters
+  - Station-Keeping Box: 10 km spherical radius
+
+FRONTEND REQUIREMENTS (5 visualization modules):
+  1. Ground Track Map (Mercator) — satellite positions, trails, terminator line
+  2. Conjunction Bullseye (Polar Chart) — nearby debris risk visualization
+  3. Fleet Fuel Heatmap — fuel gauges for all satellites
+  4. Maneuver Timeline (Gantt Chart) — burns + cooldowns
+  5. Delta-V History Graph — cumulative fuel usage
+
+DEPLOYMENT:
+  - Dockerfile at repo root using ubuntu:22.04 base image
+  - Port 8000 exposed, bound to 0.0.0.0
+
+EVALUATION CRITERIA:
+  Safety Score (collisions avoided)     — 25%
+  Fuel Efficiency (total delta-V)       — 20%
+  Constellation Uptime                  — 15%
+  Algorithmic Speed                     — 15%
+  UI/UX & Visualization                 — 15%
+  Code Quality & Logging                — 10%
+
+================================================================================
+2. PROJECT FILE STRUCTURE
+================================================================================
+
+IIT-DELHI--main/
+├── realsim.py                    Test simulator (15 sats + 500 debris)
+├── simulator.log                 Last run log
+├── NSH_PS.pdf                    Problem statement
+├── ACM_Codebase_Report.txt       This report
+│
+├── app/                          BACKEND (FastAPI)
+│   ├── __init__.py
+│   ├── main.py                   App init, CORS, route registration
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── physics.py            Orbital mechanics engine (~620 lines)
+│   │   └── simulation.py         Simulation orchestrator (~638 lines)
+│   ├── models/
+│   │   ├── __init__.py
+│   │   └── state.py              Data classes (~62 lines)
+│   └── api/
+│       ├── __init__.py
+│       └── routes.py             REST endpoints (~255 lines)
+│
+└── frontend/                     FRONTEND (Canvas Dashboard)
+    ├── index.html                Page layout (~186 lines)
+    └── dashboard.js              Rendering engine (~1000+ lines)
+
+================================================================================
+3. BACKEND DETAILED BREAKDOWN
+================================================================================
+
+3.1  app/main.py — Entry Point
+-------------------------------
+- Framework: FastAPI
+- CORS middleware enabled for all origins
+- Includes routes from app.api.routes
+- Health check at root endpoint: GET / -> {"message": "ACM Backend Running"}
+
+3.2  app/models/state.py — Data Models
+---------------------------------------
+Classes:
+  - SatelliteStatus (Enum): NOMINAL, EVADING, RECOVERING, EOL, DEAD
+  - SatelliteState: id, state (6D vector), m_fuel, m_dry, status,
+    scheduled_burns, last_burn_time, collision_count, outage_seconds
+    Property: fuel_fraction = remaining fuel / initial fuel
+  - DebrisState: id, state (6D vector)
+  - CDMWarning: sat_id, deb_id, tca_sim_time, miss_distance_km,
+    is_critical (< 100m), evasion_scheduled flag
+  - GroundStation: id, name, lat, lon, alt_m, min_elev_deg
+
+3.3  app/core/physics.py — Orbital Mechanics Engine
+----------------------------------------------------
+Constants (all matching problem statement):
+  MU = 398600.4418 km³/s²
+  RE = 6378.137 km
+  J2 = 1.08263e-3
+  ISP = 300.0 s
+  G0 = 9.80665 m/s²
+  MAX_DELTA_V = 0.015 km/s (15 m/s)
+  CONJUNCTION_THRESHOLD = 0.100 km (100 m)
+  THRUSTER_COOLDOWN = 600 s
+  STATION_KEEPING_RADIUS = 10.0 km
+
+Core Functions:
+
+  j2_acceleration(r)
+    - Computes J2 perturbation acceleration vector
+    - Formula: a_J2 = (3/2)*J2*mu*RE²/|r|⁵ * [x(5z²/r²-1), y(5z²/r²-1), z(5z²/r²-3)]
+
+  state_derivative(state)
+    - Returns d/dt of 6D state vector
+    - Combines two-body gravity + J2 perturbation
+
+  rk4_step(state, dt)
+    - Single Runge-Kutta 4th order integration step
+    - O(dt⁴) accuracy per step
+
+  propagate(state, duration_s, dt=30.0)
+    - Propagates state forward by duration using repeated RK4 steps
+
+  propagate_trajectory(state, duration_s, dt=60.0)
+    - Returns full trajectory array (used for visualization)
+
+  eci_to_rtn_matrix(r, v)
+    - Builds rotation matrix from ECI to RTN (Radial-Transverse-Normal)
+    - R = r/|r|, N = (r×v)/|r×v|, T = N×R
+
+  rtn_to_eci(dv_rtn, r, v)
+    - Converts delta-V from RTN frame back to ECI frame
+
+  compute_fuel_consumed(m_current, delta_v_km_s)
+    - Tsiolkovsky: delta_m = m_current * (1 - exp(-|dV| / (Isp*g0)))
+
+  validate_burn(delta_v_vec, fuel_remaining, m_dry)
+    - Checks: |dV| <= 15 m/s, sufficient fuel available
+    - Returns (is_valid, reason_string)
+
+  eci_to_geodetic(r_eci, gmst_rad=0.0)
+    - Converts ECI position to latitude/longitude/altitude
+    - Uses spherical Earth model with GMST rotation
+
+  compute_gmst(elapsed_seconds, epoch_gmst_rad=0.0)
+    - Greenwich Mean Sidereal Time for Earth rotation correction
+    - Earth rotation rate: 7.292115e-5 rad/s
+
+  check_line_of_sight(sat_r_eci, gs_lat, gs_lon, gs_alt_m, gs_min_elev_deg, gmst_rad)
+    - Checks if satellite is visible from ground station
+    - Computes elevation angle, compares to minimum mask
+
+  find_closest_approach(sat_state, deb_state, horizon_s=86400, coarse_dt=60, fine_dt=5)
+    - Two-pass algorithm: coarse scan (60s steps) then fine refinement (5s)
+    - Returns (tca_seconds, min_distance_km)
+
+  plan_evasion_burn(sat_state, tca_seconds, miss_distance_km)
+    - Plans transverse (prograde) burn in RTN frame
+    - Target separation: 500m (5x safety margin)
+    - Clamped to MAX_DELTA_V * 0.8
+
+  plan_recovery_burn(sat_state, nominal_state)
+    - Corrects velocity difference to return to nominal slot
+    - Clamped to MAX_DELTA_V * 0.9
+
+  graveyard_burn(sat_state)
+    - Maximum retrograde burn for end-of-life deorbit
+
+3.4  app/core/simulation.py — Simulation Manager
+-------------------------------------------------
+Class: SimulationManager (singleton via get_sim_manager())
+
+Initialization:
+  - Epoch: 2026-03-12T08:00:00Z
+  - Walker-Delta constellation: 5 planes × 10 sats = 50 satellites
+    - 550 km altitude, 53° inclination
+    - 72° RAAN spacing between planes
+    - 36° true anomaly spacing within planes
+    - Circular velocity: sqrt(mu/a) ≈ 7.58 km/s
+  - 6 ground stations (from problem statement)
+  - KD-Tree for debris spatial indexing
+
+Key Methods:
+
+  _rebuild_debris_tree()
+    - Rebuilds scipy KD-Tree from current debris positions
+    - Lazy rebuild when _tree_dirty flag is set
+
+  _get_nearby_debris(sat_position, search_radius_km=500.0)
+    - O(log N) query for debris within radius
+    - Returns list of debris IDs for detailed TCA analysis
+
+  ingest_telemetry(timestamp, objects)
+    - Updates internal state vectors from incoming telemetry
+    - Flags KD-Tree dirty if debris positions changed
+    - Returns processed count
+
+  run_conjunction_assessment()
+    - For each satellite (skip DEAD):
+      1. KD-Tree query: find debris within 500 km
+      2. For each nearby debris: compute TCA
+      3. If miss_distance < 100m: create CDMWarning
+      4. Auto-schedule evasion for critical CDMs
+    - Purges expired CDMs
+
+  _auto_schedule_evasion(sat_id, cdm)
+    - Checks: satellite exists, has fuel, has LOS to ground station
+    - Schedules evasion burn (now + 10s latency + cooldown)
+    - Schedules recovery burn (after TCA + cooldown)
+    - Sets satellite status to EVADING
+
+  schedule_maneuver(satellite_id, maneuver_sequence)
+    - Validates each burn: dV limit, fuel, LOS, cooldown
+    - Simulates fuel depletion across entire sequence
+    - Returns (has_los, projected_mass_remaining_kg)
+
+  step(step_seconds)
+    - Main simulation loop, advances by step_seconds in 30s sub-steps
+    - Per sub-step:
+      1. Propagate all debris via RK4
+      2. Propagate all satellites via RK4
+      3. Execute scheduled burns within [t, t+dt]
+      4. Check station-keeping (10 km drift tolerance)
+      5. Collision detection (< 100m = collision logged)
+      6. EOL check (fuel <= 5% -> graveyard burn)
+    - After step: flag KD-Tree dirty, run conjunction assessment
+    - Returns (collisions_detected, maneuvers_executed)
+
+  get_snapshot()
+    - Returns JSON with satellite/debris positions in lat/lon/alt
+    - Converts ECI -> geodetic using GMST
+    - Debris as compact tuples [id, lat, lon, alt_km]
+
+3.5  app/api/routes.py — REST Endpoints
+----------------------------------------
+Pydantic Models:
+  Vec3 — {x, y, z} with to_numpy() helper
+  TelemetryObject — {id, type, r: Vec3, v: Vec3}
+  TelemetryRequest — {timestamp, objects[]}
+  BurnCommand — {burn_id, burnTime, deltaV_vector: Vec3}
+  ManeuverRequest — {satelliteId, maneuver_sequence[]}
+  SimStepRequest — {step_seconds}
+
+Endpoints:
+
+  POST /api/telemetry
+    - Ingests state vectors from simulator
+    - Response: {status: "ACK", processed_count, active_cdm_warnings}
+
+  POST /api/maneuver/schedule
+    - Schedules burn sequence for a satellite
+    - Validates all burns before queuing
+    - Response (202): {status: "SCHEDULED", validation: {...}}
+
+  POST /api/simulate/step
+    - Advances simulation clock
+    - Response: {status: "STEP_COMPLETE", new_timestamp, collisions_detected,
+      maneuvers_executed}
+
+  GET /api/visualization/snapshot
+    - Returns current state for frontend rendering
+    - Response: {timestamp, satellites[], debris_cloud[]}
+
+  GET /health — Backend health check
+  GET /api/debug/satellites — List all satellite states
+  GET /api/debug/cdms — List active CDM warnings
+
+================================================================================
+4. FRONTEND DETAILED BREAKDOWN
+================================================================================
+
+4.1  frontend/index.html — Page Structure
+------------------------------------------
+- Fonts: Orbitron (headers), Inter (body), Share Tech Mono (data)
+- Dark space theme: #0a0e1a background, cyan/green/amber/red accents
+- Layout: Header + controls + 2×2 canvas grid + bottom graph
+- Header shows: sim clock, epoch, satellite count, debris count, CDM warnings
+- Satellite selector dropdown for bullseye focus
+
+4.2  frontend/dashboard.js — Rendering Engine
+-----------------------------------------------
+Global State:
+  - satellites[], debrisCloud[], simTimeSec, epochDate
+  - selectedSat, trailHistory{}, maneuverLog[], dvHistory[]
+  - isConnected, toggle flags (trails, terminator, debris)
+
+MODULE 1: Ground Track Map (Mercator)
+  - Lat/lon grid with equator highlight
+  - Terminator line (day/night boundary based on sim time)
+  - Debris cloud rendered as small red squares
+  - 6 ground stations with labels
+  - Satellite markers with solar panel shape
+  - 90-minute historical trails with fading alpha
+  - Dashed predicted trajectory (sinusoidal approximation)
+  - Click to select satellite, hover for tooltip
+
+MODULE 2: Conjunction Bullseye (Polar Chart)
+  - Centered on selected satellite
+  - Radial distance = Time to Closest Approach (6h/12h/18h/24h rings)
+  - Angle = approach bearing
+  - Color coding: Green (safe), Yellow (<5 km), Orange (<1 km), Red (<100m)
+  - Critical debris labeled with ID
+  - Samples first 200 debris for performance
+
+MODULE 3: Fleet Fuel Heatmap
+  - Grid of fuel gauge cells (one per satellite)
+  - Bar height proportional to fuel (0-50 kg)
+  - Color: green (>50%) -> amber (20-50%) -> red (<20%)
+  - Status stripe: green/yellow/cyan/purple/red
+  - Fleet average fuel percentage displayed
+
+MODULE 4: Maneuver Timeline (Gantt Chart)
+  - Y-axis: satellite rows (20 displayed)
+  - X-axis: 2-hour window around current time
+  - Burn blocks: amber (evasion), blue (recovery), grey (cooldown)
+  - "NOW" marker as cyan dashed line
+  - 10-minute time tick labels
+
+MODULE 5: Delta-V History Graph
+  - Line chart of cumulative delta-V over simulation time
+  - Tracks collisions avoided counter
+
+API Polling:
+  - GET /api/visualization/snapshot every 2 seconds
+  - Updates state, maintains trail history (90 min window)
+  - Triggers canvas redraws via requestAnimationFrame (60 FPS)
+
+================================================================================
+5. TEST SIMULATOR (realsim.py)
+================================================================================
+
+Purpose: Standalone simulator feeding test data to the ACM backend
+
+Configuration:
+  - Backend URL: http://127.0.0.1:8000
+  - Epoch: 2026-03-12 08:00:00 UTC
+  - 15 satellites across 5 orbital planes
+  - 500 background debris + 3 close-approach debris
+  - Telemetry rate: every 2 seconds
+  - Sim step: 60 seconds per tick
+  - Max ticks: 200 (~3.3 sim-hours)
+
+Test Satellite Fleet (15 satellites):
+  Plane A (Earth Obs):    SAT-Alpha-01/02/03  — 53° inc, 550 km, 0° RAAN
+  Plane B (Comms):        SAT-Beta-01/02/03   — 45° inc, 600 km, 72° RAAN
+  Plane C (SAR Radar):    SAT-Gamma-01/02/03  — 97° inc, 500 km, 144° RAAN
+  Plane D (Nav/Timing):   SAT-Delta-01/02/03  — 55° inc, 560 km, 216° RAAN
+  Plane E (Tech Demo):    SAT-Eps-01/02/03    — 28° inc, 480 km, 288° RAAN
+
+Close-Approach Debris:
+  - 3 debris objects placed 200 km ahead of Alpha-01, Gamma-01, Delta-02
+  - 0.2% lower velocity to create convergent trajectories
+  - Designed to trigger conjunction detection and evasion
+
+SimObject Dataclass:
+  - obj_id, obj_type (SATELLITE/DEBRIS), state (6D), fuel_kg
+  - propagate(dt_sec) — RK4 step
+  - to_telemetry_dict(timestamp) — JSON format for API
+
+ACMClient (HTTP):
+  - health(), send_telemetry(), simulate_step()
+  - schedule_maneuver(), get_snapshot(), get_cdms()
+
+Main Loop:
+  1. Wait for backend health (15 retries, 2s each)
+  2. Build 518 objects (15 sats + 503 debris)
+  3. Per tick: propagate -> send telemetry -> advance clock -> display
+  4. Every 20 ticks: schedule demo maneuver
+  5. Print colored terminal dashboard with satellite table + CDM warnings
+
+================================================================================
+6. DATA FLOW ARCHITECTURE
+================================================================================
+
+  realsim.py (External Simulator)
+       |
+       |-- POST /api/telemetry ---------> SimulationManager
+       |-- POST /api/simulate/step -----> RK4 + burns + CDM scan
+       |-- POST /api/maneuver/schedule -> validation + queueing
+       |
+       |-- GET /api/visualization/snapshot
+       |                                      ^
+       |                                      |
+  frontend/dashboard.js (polls every 2s) -----+
+       |
+       +-- Canvas rendering at 60 FPS
+           ├── Ground Track Map
+           ├── Conjunction Bullseye
+           ├── Fuel Heatmap
+           ├── Maneuver Timeline
+           └── Delta-V History
+
+================================================================================
+7. KEY ALGORITHMS
+================================================================================
+
+7.1 Orbital Propagation (RK4 + J2)
+  State: s = [x, y, z, vx, vy, vz]
+  ds/dt = [v, -mu/|r|³ * r + a_J2(r)]
+  s(t+dt) = s(t) + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+
+7.2 Tsiolkovsky Rocket Equation
+  fuel_consumed = m_current * (1 - exp(-|dV| / (Isp * g0)))
+
+7.3 TCA Computation (Two-Pass)
+  Pass 1: 60s steps over 86400s horizon -> find approximate minimum
+  Pass 2: 5s steps around coarse minimum -> refine TCA
+  Result: (tca_seconds, min_distance_km)
+
+7.4 KD-Tree Conjunction Search
+  Build KD-Tree from all debris 3D positions
+  For each satellite: query debris within 500 km radius -> O(log N)
+  Only run detailed TCA on nearby debris -> avoids O(N²)
+
+7.5 Evasion Maneuver (RTN Frame)
+  Target separation: 500m (5x safety margin over 100m threshold)
+  Delta-separation = max(0, 0.5 - miss_distance_km)
+  Transverse dV = delta_separation / (2 * TCA/1000)
+  Clamped to MAX_DELTA_V * 0.8
+  Convert RTN -> ECI via rotation matrix
+
+7.6 Line-of-Sight Check
+  Ground station geodetic -> ECI using GMST rotation
+  Elevation angle = arcsin((r_sat - r_gs) . r_gs_hat / |r_sat - r_gs|)
+  LOS valid if elevation >= min_elevation_mask
+
+================================================================================
+8. PHYSICAL CONSTANTS VERIFICATION (vs Problem Statement)
+================================================================================
+
+  Constant               Code Value          PDF Value          Match?
+  -----------------------------------------------------------------------
+  mu (gravity)           398600.4418         398600.4418        YES
+  RE (Earth radius)      6378.137            6378.137           YES
+  J2 (oblateness)        1.08263e-3          1.08263e-3         YES
+  Dry mass               500.0 kg            500.0 kg           YES
+  Initial fuel           50.0 kg             50.0 kg            YES
+  Isp                    300.0 s             300.0 s            YES
+  Max dV per burn        15.0 m/s            15.0 m/s           YES
+  Thruster cooldown      600 s               600 s              YES
+  Collision threshold    100 m               100 m              YES
+  Station-keeping box    10 km               10 km              YES
+  Signal delay           10 s                10 s               YES
+
+  ALL CONSTANTS MATCH.
+
+================================================================================
+9. GAPS & MISSING ITEMS
+================================================================================
+
+  Item                        Required By PDF           Status
+  -----------------------------------------------------------------------
+  Dockerfile                  HARD REQUIREMENT          MISSING (disqualification risk)
+  Base image ubuntu:22.04     HARD REQUIREMENT          MISSING
+  Port 8000 binding           HARD REQUIREMENT          Backend does this, no Dockerfile
+  Database                    Expected deliverable      NOT PRESENT (all in-memory)
+  Structured logging          10% of score              BASIC ONLY
+  Predicted trajectory        Dashed line, next 90 min  SIMPLIFIED (sinusoidal approx)
+  WebGL rendering             Recommended for 10K+      CANVAS 2D ONLY
+  Signal delay validation     10s min in manual sched   NOT STRICTLY ENFORCED
+  Ground stations CSV file    Provided dataset          HARDCODED IN CODE (not CSV)
+
+================================================================================
+10. HOW TO RUN
+================================================================================
+
+Step 1: Start Backend
+  cd IIT-DELHI--main
+  pip install fastapi uvicorn scipy numpy
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+Step 2: Start Simulator
+  python realsim.py
+
+Step 3: Open Frontend
+  Open frontend/index.html in a web browser
+
+================================================================================
+END OF REPORT
+================================================================================

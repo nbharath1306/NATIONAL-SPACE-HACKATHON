@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>🚀 Orbital Insight Dashboard</title>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Inter:wght@300;400;600&family=Share+Tech+Mono&display=swap');
+        
+        body {
+            margin: 0;
+            background: radial-gradient(circle at 50% -20%, #0a1738, #01050a 80%);
+            color: #e2e8f0;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 20px;
+            background: rgba(10, 17, 40, 0.85);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(0,229,255,0.3);
+            font-family: 'Orbitron', sans-serif;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            z-index: 10;
+        }
+
+        header div {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #connDot.online {
+            color: #00ff96;
+        }
+
+        #connDot {
+            color: red;
+        }
+
+        select, button {
+            background: linear-gradient(145deg, #0b1529, #050a14);
+            color: #00e5ff;
+            border: 1px solid rgba(0,229,255,0.4);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        button:hover {
+            background: #00e5ff;
+            color: #01050a;
+            box-shadow: 0 0 10px rgba(0,229,255,0.6);
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            padding: 10px 20px;
+            background: rgba(5, 13, 24, 0.7);
+            border-bottom: 1px solid rgba(0,229,255,0.15);
+            backdrop-filter: blur(5px);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 8px;
+            height: calc(100vh - 110px);
+            padding: 8px;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            background: #01050a;
+            border: 1px solid rgba(0,255,150,0.15);
+            border-radius: 6px;
+            box-shadow: 0 0 20px rgba(0,255,150,0.05);
+        }
+
+        #dvCanvas {
+            height: 150px;
+            margin: 0 8px 8px 8px;
+        }
+
+        #fleetFuelAvg {
+            position: absolute;
+            bottom: 10px;
+            left: 15px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        #alertBanner {
+            position: absolute;
+            top: 60px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(255,50,50,0.9);
+            padding: 6px 12px;
+            border-radius: 4px;
+            color: white;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        #mapTooltip {
+            position: absolute;
+            background: rgba(0,0,0,0.8);
+            padding: 5px 8px;
+            border: 1px solid #00ff96;
+            border-radius: 4px;
+            font-size: 11px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+
+<header>
+    <div>
+        ⏱ <span id="simClock">T+00:00:00</span>
+        📅 <span id="epochClock"></span>
+    </div>
+
+    <div>
+        🛰 <span id="statSatCount">0</span>
+        ☄️ <span id="statDebrisCount">0</span>
+        ⚠️ <span id="statCDMCount">0</span>
+    </div>
+
+    <div>
+        <span id="connDot">●</span>
+        <span id="connLabel">OFFLINE</span>
+    </div>
+
+    <div>
+        <select id="satSelector"></select>
+    </div>
+</header>
+
+<!-- Controls -->
+<div class="controls">
+    <button id="btnToggleTrails">Trails</button>
+    <button id="btnToggleTerminator">Terminator</button>
+    <button id="btnToggleDebrisMap">Debris</button>
+</div>
+
+<!-- Main Grid -->
+<div class="grid">
+    <canvas id="groundTrackCanvas"></canvas>
+    <canvas id="bullseyeCanvas"></canvas>
+    <canvas id="fuelCanvas"></canvas>
+    <canvas id="ganttCanvas"></canvas>
+</div>
+
+<!-- Bottom Graph -->
+<canvas id="dvCanvas"></canvas>
+
+<!-- UI Elements -->
+<div id="alertBanner" class="hidden">
+    <span id="alertText"></span>
+</div>
+
+<div id="mapTooltip" class="hidden"></div>
+
+<div id="fleetFuelAvg"></div>
+
+<script src="dashboard.js"></script>
+
+</body>
+</html>

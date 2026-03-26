@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+acm_data.db
+logs/
+*.log
+.vscode/
+.env
