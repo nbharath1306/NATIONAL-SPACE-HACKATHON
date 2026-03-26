@@ -67,16 +67,21 @@ for (const [k, c] of Object.entries(canvases)) {
   ctx[k] = c.getContext('2d');
 }
 
-// ─── Resize all canvases to match their container ─────────────────
+// ─── Resize all canvases to match their rendered size ─────────────
 function resizeAll() {
   for (const [k, c] of Object.entries(canvases)) {
-    const parent = c.parentElement;
-    c.width  = parent.offsetWidth;
-    c.height = parent.offsetHeight;
+    const rect = c.getBoundingClientRect();
+    const w = Math.floor(rect.width) || 400;
+    const h = Math.floor(rect.height) || 300;
+    if (c.width !== w || c.height !== h) {
+      c.width = w;
+      c.height = h;
+    }
   }
 }
 window.addEventListener('resize', () => { resizeAll(); });
-resizeAll();
+// Defer initial resize to after layout is computed
+setTimeout(resizeAll, 50);
 
 
 // ═══════════════════════════════════════════════════════════════════
