@@ -1,1158 +1,872 @@
 /**
- * ORBITAL INSIGHT — Dashboard Engine
- * ====================================
- * All rendering is done on <canvas> elements for performance.
- * At 50 satellites + 10,000 debris, DOM-based rendering would
- * drop to ~5 FPS. Canvas lets us hit 60 FPS easily.
- *
- * Architecture:
- *  - API polling every 2s for /api/visualization/snapshot
- *  - Each module has its own canvas and draw() function
- *  - State is stored globally in `state` object
- *  - requestAnimationFrame drives rendering at 60 FPS
+ * ORBITAL INSIGHT — Premium Dashboard Engine
+ * =============================================
+ * Canvas-based rendering at 60 FPS for 50+ satellites and 10K+ debris.
  */
 
 'use strict';
 
-// ─── Global State ────────────────────────────────────────────────
-// Use relative URL when served from backend, fallback to localhost for dev
+// ─── Configuration ───────────────────────────────────────────────
 const API_BASE = window.location.port === '8000' ? '' : 'http://127.0.0.1:8000';
-const POLL_INTERVAL_MS = 2000;
+const POLL_MS = 2000;
 
-const state = {
-  satellites: [],         // [{id, lat, lon, fuel_kg, status}]
-  debrisCloud: [],        // [[id, lat, lon, alt_km], ...]
+// ─── Global State ────────────────────────────────────────────────
+const S = {
+  satellites: [],
+  debrisCloud: [],
   simTimeSec: 0,
-  epochDate: new Date('2026-03-12T08:00:00Z'),
+  epoch: new Date('2026-03-12T08:00:00Z'),
   selectedSat: null,
-  trailHistory: {},       // {satId: [{lat,lon}, ...]} — last 90min of positions
-  maneuverLog: [],        // [{satId, burnId, startTime, endTime, type}]
-  dvHistory: [],          // [{fuel_used, collisions_avoided, timestamp}]
-  lastSnapshot: null,
-  isConnected: false,
+  trails: {},
+  maneuvers: [],
+  dvHistory: [],
+  connected: false,
   showTrails: true,
   showTerminator: true,
-  showDebrisOnMap: true,
-  totalCollisionsAvoided: 0,
-  totalFuelUsed: 0,
+  showDebris: true,
+  totalCollisions: 0,
 };
 
-// ─── DOM References ───────────────────────────────────────────────
+// ─── DOM ─────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
 const els = {
-  simClock:        document.getElementById('simClock'),
-  epochClock:      document.getElementById('epochClock'),
-  statSatCount:    document.getElementById('statSatCount'),
-  statDebrisCount: document.getElementById('statDebrisCount'),
-  statCDMCount:    document.getElementById('statCDMCount'),
-  connDot:         document.getElementById('connDot'),
-  connLabel:       document.getElementById('connLabel'),
-  alertBanner:     document.getElementById('alertBanner'),
-  alertText:       document.getElementById('alertText'),
-  satSelector:     document.getElementById('satSelector'),
-  fleetFuelAvg:    document.getElementById('fleetFuelAvg'),
-  mapTooltip:      document.getElementById('mapTooltip'),
+  simClock: $('simClock'), epochClock: $('epochClock'),
+  satCount: $('statSatCount'), debCount: $('statDebrisCount'), cdmCount: $('statCDMCount'),
+  connBadge: $('connBadge'), connLabel: $('connLabel'),
+  alert: $('alertBanner'), alertText: $('alertText'),
+  selector: $('satSelector'), fuelAvg: $('fleetFuelAvg'), tooltip: $('mapTooltip'),
+  fuelBadge: $('fuelBadge'), dvBadge: $('dvBadge'),
 };
 
-// ─── Canvas Contexts ──────────────────────────────────────────────
-const canvases = {
-  groundTrack: document.getElementById('groundTrackCanvas'),
-  bullseye:    document.getElementById('bullseyeCanvas'),
-  fuel:        document.getElementById('fuelCanvas'),
-  gantt:       document.getElementById('ganttCanvas'),
-  dv:          document.getElementById('dvCanvas'),
-};
-
-const ctx = {};
-for (const [k, c] of Object.entries(canvases)) {
-  ctx[k] = c.getContext('2d');
+// ─── Canvas Setup ────────────────────────────────────────────────
+const CID = ['groundTrack', 'bullseye', 'fuel', 'gantt', 'dv'];
+const canvas = {}, ctx = {};
+for (const id of CID) {
+  canvas[id] = $(id + 'Canvas');
+  ctx[id] = canvas[id].getContext('2d');
 }
 
-// ─── Resize all canvases to match their rendered size ─────────────
-function resizeAll() {
-  for (const [k, c] of Object.entries(canvases)) {
-    const rect = c.getBoundingClientRect();
-    const w = Math.floor(rect.width) || 400;
-    const h = Math.floor(rect.height) || 300;
-    if (c.width !== w || c.height !== h) {
-      c.width = w;
-      c.height = h;
+function resize() {
+  for (const id of CID) {
+    const c = canvas[id];
+    const r = c.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.floor(r.width);
+    const h = Math.floor(r.height);
+    if (c.width !== w * dpr || c.height !== h * dpr) {
+      c.width = w * dpr;
+      c.height = h * dpr;
+      c.style.width = w + 'px';
+      c.style.height = h + 'px';
+      ctx[id].setTransform(dpr, 0, 0, dpr, 0, 0);
     }
   }
 }
-window.addEventListener('resize', () => { resizeAll(); });
-// Defer initial resize to after layout is computed
-setTimeout(resizeAll, 50);
+window.addEventListener('resize', resize);
+setTimeout(resize, 100);
 
-
-// ═══════════════════════════════════════════════════════════════════
-// MODULE 1: GROUND TRACK MAP (Mercator Projection)
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * Mercator projection:
- * Maps lat/lon to x/y on a flat rectangle.
- * x = (lon + 180) / 360 * width          (linear)
- * y = (90 - lat)  / 180 * height         (linear — simplified flat Mercator)
- *
- * The "Terminator line" is the day/night boundary. It's a great circle
- * rotated by the sun's hour angle. We approximate the sun's subsolar
- * point and draw a sinusoidal curve across the map.
- */
-
-// World map image (we draw a minimalist grid ourselves)
-let worldMapDrawn = false;
-
-function latLonToXY(lat, lon, W, H) {
-  const x = ((lon + 180) / 360) * W;
-  const y = ((90 - lat) / 180) * H;
-  return [x, y];
+// ─── Helpers ─────────────────────────────────────────────────────
+function ll2xy(lat, lon, W, H) {
+  return [((lon + 180) / 360) * W, ((90 - lat) / 180) * H];
 }
 
-function drawGroundTrack() {
-  const c = canvases.groundTrack;
-  const g = ctx.groundTrack;
-  const W = c.width, H = c.height;
+function statusColor(s) {
+  return { NOMINAL: '#39ff7a', EVADING: '#ffb830', RECOVERING: '#3b8bff', EOL: '#a855f7', DEAD: '#ff3b52' }[s] || '#39ff7a';
+}
 
-  // ── Background ──
-  g.fillStyle = '#020810';
+function formatTime(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  return `T+${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// ═════════════════════════════════════════════════════════════════
+// MODULE 1: GROUND TRACK MAP
+// ═════════════════════════════════════════════════════════════════
+
+const GS = [
+  { name: 'ISTRAC', lat: 13.033, lon: 77.517 },
+  { name: 'Svalbard', lat: 78.230, lon: 15.408 },
+  { name: 'Goldstone', lat: 35.427, lon: -116.89 },
+  { name: 'P.Arenas', lat: -53.15, lon: -70.917 },
+  { name: 'IIT Delhi', lat: 28.545, lon: 77.193 },
+  { name: 'McMurdo', lat: -77.846, lon: 166.668 },
+];
+
+function drawMap() {
+  const c = canvas.groundTrack, g = ctx.groundTrack;
+  const r = c.getBoundingClientRect();
+  const W = r.width, H = r.height;
+
+  // Background gradient
+  const bg = g.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#040a18');
+  bg.addColorStop(0.5, '#061020');
+  bg.addColorStop(1, '#040a18');
+  g.fillStyle = bg;
   g.fillRect(0, 0, W, H);
 
-  // ── Grid lines (lon/lat every 30°) ──
-  g.strokeStyle = 'rgba(26,45,69,0.6)';
+  // Grid
   g.lineWidth = 0.5;
   for (let lon = -180; lon <= 180; lon += 30) {
-    const [x] = latLonToXY(0, lon, W, H);
+    const x = ll2xy(0, lon, W, H)[0];
+    g.strokeStyle = lon === 0 ? 'rgba(0,229,255,0.12)' : 'rgba(20,40,70,0.5)';
     g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke();
+    if (lon % 60 === 0) {
+      g.fillStyle = 'rgba(60,100,140,0.35)';
+      g.font = '8px "Share Tech Mono"';
+      g.fillText(`${lon}°`, x + 2, H - 4);
+    }
   }
   for (let lat = -90; lat <= 90; lat += 30) {
-    const [, y] = latLonToXY(lat, 0, W, H);
+    const y = ll2xy(lat, 0, W, H)[1];
+    g.strokeStyle = lat === 0 ? 'rgba(0,180,200,0.2)' : 'rgba(20,40,70,0.5)';
+    g.lineWidth = lat === 0 ? 1 : 0.5;
     g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
+    if (lat !== 0 && lat % 30 === 0) {
+      g.fillStyle = 'rgba(60,100,140,0.35)';
+      g.font = '8px "Share Tech Mono"';
+      g.fillText(`${lat}°`, 3, y - 3);
+    }
   }
 
-  // Equator highlight
-  g.strokeStyle = 'rgba(0,150,170,0.25)';
-  g.lineWidth = 1;
-  const [, eqY] = latLonToXY(0, 0, W, H);
-  g.beginPath(); g.moveTo(0, eqY); g.lineTo(W, eqY); g.stroke();
+  // Terminator
+  if (S.showTerminator) {
+    const hourAngle = (S.simTimeSec / 3600) * 15;
+    const sunLon = ((-180 + hourAngle) % 360 + 360) % 360 - 180;
+    const nightLon = ((sunLon + 180) % 360 + 360) % 360 - 180;
+    const [nx] = ll2xy(0, nightLon, W, H);
+    const hw = W / 4;
 
-  // ── Terminator Line (day/night) ──
-  if (state.showTerminator) {
-    drawTerminator(g, W, H);
+    g.save();
+    g.globalAlpha = 0.3;
+    g.fillStyle = '#000510';
+    // Night band
+    const left = nx - hw, right = nx + hw;
+    if (left < 0) {
+      g.fillRect(0, 0, right, H);
+      g.fillRect(W + left, 0, -left, H);
+    } else if (right > W) {
+      g.fillRect(left, 0, W - left, H);
+      g.fillRect(0, 0, right - W, H);
+    } else {
+      g.fillRect(left, 0, hw * 2, H);
+    }
+    g.restore();
+
+    // Terminator lines
+    g.strokeStyle = 'rgba(255,200,50,0.15)';
+    g.lineWidth = 1;
+    g.setLineDash([6, 4]);
+    const tl = ll2xy(0, sunLon - 90, W, H)[0];
+    const tr = ll2xy(0, sunLon + 90, W, H)[0];
+    g.beginPath(); g.moveTo(tl, 0); g.lineTo(tl, H); g.stroke();
+    g.beginPath(); g.moveTo(tr, 0); g.lineTo(tr, H); g.stroke();
+    g.setLineDash([]);
   }
 
-  // ── Debris Cloud ──
-  if (state.showDebrisOnMap && state.debrisCloud.length > 0) {
-    g.fillStyle = 'rgba(255,100,100,0.25)';
-    for (const d of state.debrisCloud) {
-      const [, lat, lon] = d;
-      const [x, y] = latLonToXY(lat, lon, W, H);
+  // Debris
+  if (S.showDebris && S.debrisCloud.length > 0) {
+    g.fillStyle = 'rgba(255,80,80,0.2)';
+    for (const d of S.debrisCloud) {
+      const [x, y] = ll2xy(d[1], d[2], W, H);
       g.fillRect(x - 0.5, y - 0.5, 1.5, 1.5);
     }
   }
 
-  // ── Ground Stations ──
-  const groundStations = [
-    { name: 'ISTRAC', lat: 13.0333, lon: 77.5167 },
-    { name: 'Svalbard', lat: 78.2297, lon: 15.4077 },
-    { name: 'Goldstone', lat: 35.4266, lon: -116.890 },
-    { name: 'Punta Arenas', lat: -53.15, lon: -70.917 },
-    { name: 'IIT Delhi', lat: 28.545, lon: 77.193 },
-    { name: 'McMurdo', lat: -77.846, lon: 166.668 },
-  ];
-  for (const gs of groundStations) {
-    const [x, y] = latLonToXY(gs.lat, gs.lon, W, H);
-    g.strokeStyle = 'rgba(0,229,255,0.5)';
-    g.lineWidth = 1;
+  // Ground stations
+  for (const gs of GS) {
+    const [x, y] = ll2xy(gs.lat, gs.lon, W, H);
+    // Range circle
+    g.beginPath(); g.arc(x, y, 20, 0, Math.PI * 2);
+    g.strokeStyle = 'rgba(0,229,255,0.08)'; g.lineWidth = 1; g.stroke();
+    g.fillStyle = 'rgba(0,229,255,0.04)'; g.fill();
+    // Station dot
+    g.beginPath(); g.arc(x, y, 3, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(0,229,255,0.7)'; g.fill();
+    // Diamond shape
+    g.strokeStyle = 'rgba(0,229,255,0.5)'; g.lineWidth = 1;
     g.beginPath();
-    g.arc(x, y, 5, 0, Math.PI * 2);
+    g.moveTo(x, y - 5); g.lineTo(x + 4, y); g.lineTo(x, y + 5); g.lineTo(x - 4, y); g.closePath();
     g.stroke();
-    g.fillStyle = 'rgba(0,229,255,0.6)';
+    // Label
+    g.fillStyle = 'rgba(0,229,255,0.5)';
     g.font = '7px "Share Tech Mono"';
-    g.fillText(gs.name, x + 6, y + 3);
+    g.fillText(gs.name, x + 7, y + 3);
   }
 
-  // ── Orbit Trails ──
-  if (state.showTrails) {
-    for (const [satId, trail] of Object.entries(state.trailHistory)) {
+  // Trails
+  if (S.showTrails) {
+    for (const [id, trail] of Object.entries(S.trails)) {
       if (trail.length < 2) continue;
-      const sat = state.satellites.find(s => s.id === satId);
-      const baseColor = satStatusColor(sat?.status);
-
-      g.lineWidth = 0.8;
-      g.setLineDash([3, 4]);
+      const sat = S.satellites.find(s => s.id === id);
+      const col = statusColor(sat?.status);
       for (let i = 1; i < trail.length; i++) {
-        const alpha = (i / trail.length) * 0.4;
-        g.strokeStyle = baseColor.replace('1)', `${alpha})`);
-        g.beginPath();
-        const [x0, y0] = latLonToXY(trail[i-1].lat, trail[i-1].lon, W, H);
-        const [x1, y1] = latLonToXY(trail[i].lat, trail[i].lon, W, H);
-        // Don't draw line if it wraps around the globe
-        if (Math.abs(x1 - x0) < W * 0.3) {
-          g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
-        }
+        const a = (i / trail.length) * 0.5;
+        const [x0, y0] = ll2xy(trail[i - 1].lat, trail[i - 1].lon, W, H);
+        const [x1, y1] = ll2xy(trail[i].lat, trail[i].lon, W, H);
+        if (Math.abs(x1 - x0) > W * 0.3) continue;
+        g.strokeStyle = col.replace(')', `,${a})`).replace('rgb', 'rgba');
+        g.lineWidth = 1;
+        g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
       }
-      g.setLineDash([]);
     }
   }
 
-  // ── Predicted Track (dashed, next 90 min) ──
-  // In a live system, this would use the physics propagator.
-  // Here we draw a simplified sinusoidal approximation.
-  for (const sat of state.satellites) {
-    if (!sat._predictedTrack) continue;
-    g.strokeStyle = 'rgba(59,139,255,0.35)';
-    g.lineWidth = 0.7;
-    g.setLineDash([5, 6]);
-    g.beginPath();
-    let first = true;
-    for (const pt of sat._predictedTrack) {
-      const [x, y] = latLonToXY(pt.lat, pt.lon, W, H);
-      if (first) { g.moveTo(x, y); first = false; }
-      else g.lineTo(x, y);
-    }
-    g.stroke();
-    g.setLineDash([]);
-  }
+  // Satellites
+  for (const sat of S.satellites) {
+    const [x, y] = ll2xy(sat.lat, sat.lon, W, H);
+    const col = statusColor(sat.status);
+    const sel = sat.id === S.selectedSat;
 
-  // ── Satellite Markers ──
-  for (const sat of state.satellites) {
-    const [x, y] = latLonToXY(sat.lat, sat.lon, W, H);
-    const color = satStatusColor(sat.status);
-    const isSelected = sat.id === state.selectedSat;
-
-    // Glow ring for selected
-    if (isSelected) {
-      g.beginPath();
-      g.arc(x, y, 10, 0, Math.PI * 2);
-      g.strokeStyle = 'rgba(0,229,255,0.6)';
-      g.lineWidth = 1.5;
-      g.stroke();
+    // Glow
+    if (sel) {
+      g.beginPath(); g.arc(x, y, 14, 0, Math.PI * 2);
+      g.strokeStyle = 'rgba(0,229,255,0.4)'; g.lineWidth = 1.5; g.stroke();
+      g.beginPath(); g.arc(x, y, 18, 0, Math.PI * 2);
+      g.strokeStyle = 'rgba(0,229,255,0.15)'; g.lineWidth = 1; g.stroke();
     }
 
-    // Satellite realistic shape (central body + solar panels)
-    g.save();
-    g.translate(x, y);
-    // Draw solar panels
-    g.fillStyle = '#2c5282'; // Deep blue panels
-    g.fillRect(-7, -1.5, 4, 3);
-    g.fillRect(3, -1.5, 4, 3);
-    
-    // Draw connecting strut
-    g.fillStyle = '#a0aec0';
+    // Body
+    g.save(); g.translate(x, y);
+    // Solar panels
+    g.fillStyle = 'rgba(40,80,160,0.7)';
+    g.fillRect(-8, -2, 5, 4); g.fillRect(3, -2, 5, 4);
+    // Panel lines
+    g.strokeStyle = 'rgba(60,120,200,0.4)'; g.lineWidth = 0.5;
+    g.strokeRect(-8, -2, 5, 4); g.strokeRect(3, -2, 5, 4);
+    // Strut
+    g.fillStyle = 'rgba(160,180,200,0.6)';
     g.fillRect(-3, -0.5, 6, 1);
-    
-    // Draw central body
-    g.beginPath();
-    g.arc(0, 0, isSelected ? 3 : 2, 0, Math.PI * 2);
-    g.fillStyle = color;
-    g.shadowBlur = isSelected ? 12 : 5;
-    g.shadowColor = color;
-    g.fill();
-    g.shadowBlur = 0;
-    
-    // Add a tiny glowing antenna
-    g.fillStyle = '#ffffff';
-    g.fillRect(-0.5, -3, 1, 2);
+    // Core
+    g.beginPath(); g.arc(0, 0, sel ? 3.5 : 2.5, 0, Math.PI * 2);
+    g.fillStyle = col; g.shadowBlur = sel ? 16 : 8; g.shadowColor = col;
+    g.fill(); g.shadowBlur = 0;
     g.restore();
 
-    // Label for selected sat
-    if (isSelected) {
+    // Label
+    if (sel) {
       g.fillStyle = 'rgba(0,229,255,0.9)';
-      g.font = 'bold 9px "Share Tech Mono"';
-      g.fillText(sat.id, x + 8, y - 5);
+      g.font = 'bold 10px "Share Tech Mono"';
+      g.fillText(sat.id, x + 12, y - 6);
+      g.fillStyle = 'rgba(200,220,240,0.6)';
+      g.font = '8px "Share Tech Mono"';
+      g.fillText(`${sat.lat.toFixed(1)}°, ${sat.lon.toFixed(1)}°`, x + 12, y + 5);
     }
   }
+
+  // Map label
+  g.fillStyle = 'rgba(0,229,255,0.12)';
+  g.font = 'bold 10px "Orbitron"';
+  g.fillText('ECI J2000', W - 75, H - 8);
 }
 
-function satStatusColor(status) {
-  const map = {
-    'NOMINAL':    'rgba(57,255,122,1)',
-    'EVADING':    'rgba(255,184,48,1)',
-    'RECOVERING': 'rgba(59,139,255,1)',
-    'EOL':        'rgba(168,85,247,1)',
-    'DEAD':       'rgba(255,59,82,1)',
-  };
-  return map[status] || 'rgba(57,255,122,1)';
-}
-
-function drawTerminator(g, W, H) {
-  /**
-   * Approximate the day/night terminator.
-   * The subsolar point moves east at 360°/24h = 15°/hour.
-   * We compute the subsolar longitude from simulation time and
-   * shade the night side with a dark overlay.
-   *
-   * Solar declination varies seasonally; we use a fixed ~0° (equinox)
-   * since the simulation epoch is near the March equinox.
-   */
-  const hourAngle = (state.simTimeSec / 3600) * 15; // degrees east
-  const subSolarLon = -180 + (hourAngle % 360);
-  const subSolarLat = 0; // equinox approximation
-
-  // Draw night side as a dark overlay west of the terminator
-  // We sample every 2px across the width and shade accordingly
-  const termX = ((subSolarLon + 180) / 360) * W;
-
-  // Night side fill (180° opposite the subsolar point)
-  const nightWidth = W / 2;
-  let nightStart = termX - nightWidth / 2;
-
-  // Draw dark overlay for night side
-  g.save();
-  g.globalAlpha = 0.35;
-  g.fillStyle = '#000820';
-
-  // Night is opposite the subsolar point
-  const nightLon = subSolarLon + 180;
-  const [nx] = latLonToXY(0, ((nightLon + 180) % 360) - 180, W, H);
-
-  // Simple: shade a band around the anti-solar point
-  if (nx + nightWidth / 2 > W) {
-    g.fillRect(nx - nightWidth / 2, 0, W - (nx - nightWidth / 2), H);
-    g.fillRect(0, 0, (nx + nightWidth / 2) - W, H);
-  } else if (nx - nightWidth / 2 < 0) {
-    g.fillRect(0, 0, nx + nightWidth / 2, H);
-    g.fillRect(W + (nx - nightWidth / 2), 0, -(nx - nightWidth / 2), H);
-  } else {
-    g.fillRect(nx - nightWidth / 2, 0, nightWidth, H);
-  }
-  g.restore();
-
-  // Terminator line
-  g.strokeStyle = 'rgba(0,229,255,0.2)';
-  g.lineWidth = 1;
-  g.setLineDash([4, 5]);
-  g.beginPath();
-  g.moveTo(termX - nightWidth / 2, 0);
-  g.lineTo(termX - nightWidth / 2, H);
-  g.stroke();
-  g.setLineDash([]);
-}
-
-// Ground track tooltip on hover
-canvases.groundTrack.addEventListener('mousemove', (e) => {
-  const rect = canvases.groundTrack.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  const W = canvases.groundTrack.width;
-  const H = canvases.groundTrack.height;
-
-  let hovered = null;
-  for (const sat of state.satellites) {
-    const [sx, sy] = latLonToXY(sat.lat, sat.lon, W, H);
-    if (Math.hypot(mx - sx, my - sy) < 8) { hovered = sat; break; }
-  }
-
-  const tip = els.mapTooltip;
-  if (hovered) {
-    tip.classList.remove('hidden');
-    tip.style.left = (mx + 14) + 'px';
-    tip.style.top  = (my - 10) + 'px';
-    tip.innerHTML =
-      `<b>${hovered.id}</b><br>` +
-      `Lat: ${hovered.lat.toFixed(2)}° Lon: ${hovered.lon.toFixed(2)}°<br>` +
-      `Fuel: ${hovered.fuel_kg.toFixed(2)} kg<br>` +
-      `Status: <span style="color:${satStatusColor(hovered.status)}">${hovered.status}</span>`;
-  } else {
-    tip.classList.add('hidden');
-  }
-});
-
-canvases.groundTrack.addEventListener('click', (e) => {
-  const rect = canvases.groundTrack.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
-  const W = canvases.groundTrack.width;
-  const H = canvases.groundTrack.height;
-
-  for (const sat of state.satellites) {
-    const [sx, sy] = latLonToXY(sat.lat, sat.lon, W, H);
-    if (Math.hypot(mx - sx, my - sy) < 10) {
-      state.selectedSat = sat.id;
-      els.satSelector.value = sat.id;
-      break;
-    }
-  }
-});
-
-// Toggle buttons
-document.getElementById('btnToggleTrails').addEventListener('click', function() {
-  state.showTrails = !state.showTrails;
-  this.classList.toggle('active', state.showTrails);
-});
-document.getElementById('btnToggleTerminator').addEventListener('click', function() {
-  state.showTerminator = !state.showTerminator;
-  this.classList.toggle('active', state.showTerminator);
-});
-document.getElementById('btnToggleDebrisMap').addEventListener('click', function() {
-  state.showDebrisOnMap = !state.showDebrisOnMap;
-  this.classList.toggle('active', state.showDebrisOnMap);
-});
-
-
-// ═══════════════════════════════════════════════════════════════════
-// MODULE 2: CONJUNCTION BULLSEYE PLOT (Polar Chart)
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * The bullseye is a polar coordinate view:
- * - Center = selected satellite
- * - Radial distance = time to closest approach (TCA) in minutes
- *   (inner ring = imminent, outer = far future)
- * - Angle = approach direction (relative bearing of debris)
- * - Color = risk level based on miss distance
- *
- * Since we don't have real CDM data in the frontend, we synthesize
- * demo data from the debris cloud based on proximity.
- */
+// ═════════════════════════════════════════════════════════════════
+// MODULE 2: BULLSEYE PLOT
+// ═════════════════════════════════════════════════════════════════
 
 function drawBullseye() {
-  const c = canvases.bullseye;
-  const g = ctx.bullseye;
-  const W = c.width, H = c.height;
+  const c = canvas.bullseye, g = ctx.bullseye;
+  const r = c.getBoundingClientRect();
+  const W = r.width, H = r.height;
   const cx = W / 2, cy = H / 2;
-  const maxR = Math.min(W, H) / 2 - 24;
+  const maxR = Math.min(W, H) / 2 - 20;
 
-  g.clearRect(0, 0, W, H);
+  g.fillStyle = '#040a14';
+  g.fillRect(0, 0, W, H);
 
-  // ── Concentric rings ──
+  // Rings
   const rings = [
-    { r: maxR * 0.25, label: '6h', color: 'rgba(255,59,82,0.15)' },
-    { r: maxR * 0.50, label: '12h', color: 'rgba(255,184,48,0.08)' },
-    { r: maxR * 0.75, label: '18h', color: 'rgba(59,139,255,0.06)' },
-    { r: maxR * 1.00, label: '24h', color: 'rgba(26,45,69,0.3)' },
+    { f: 0.25, label: '6h', col: 'rgba(255,59,82,0.06)' },
+    { f: 0.50, label: '12h', col: 'rgba(255,184,48,0.04)' },
+    { f: 0.75, label: '18h', col: 'rgba(59,139,255,0.03)' },
+    { f: 1.00, label: '24h', col: 'rgba(20,40,70,0.15)' },
   ];
-
   for (const ring of rings) {
-    g.beginPath();
-    g.arc(cx, cy, ring.r, 0, Math.PI * 2);
-    g.strokeStyle = 'rgba(26,60,90,0.7)';
-    g.lineWidth = 0.5;
-    g.stroke();
-    // Ring label
-    g.fillStyle = 'rgba(61,96,128,0.7)';
+    const rr = maxR * ring.f;
+    // Fill zone
+    g.beginPath(); g.arc(cx, cy, rr, 0, Math.PI * 2);
+    g.fillStyle = ring.col; g.fill();
+    // Ring line
+    g.strokeStyle = 'rgba(30,60,100,0.5)'; g.lineWidth = 0.5; g.stroke();
+    // Label
+    g.fillStyle = 'rgba(80,120,160,0.5)';
     g.font = '8px "Share Tech Mono"';
-    g.fillText(ring.label, cx + ring.r - 12, cy - 3);
+    g.fillText(ring.label, cx + rr - 14, cy - 4);
   }
 
-  // ── Crosshairs ──
-  g.strokeStyle = 'rgba(26,60,90,0.5)';
-  g.lineWidth = 0.5;
+  // Crosshairs
+  g.strokeStyle = 'rgba(30,60,100,0.4)'; g.lineWidth = 0.5;
+  g.setLineDash([3, 3]);
   g.beginPath(); g.moveTo(cx - maxR, cy); g.lineTo(cx + maxR, cy); g.stroke();
   g.beginPath(); g.moveTo(cx, cy - maxR); g.lineTo(cx, cy + maxR); g.stroke();
+  // Diagonal crosses
+  g.beginPath(); g.moveTo(cx - maxR * 0.7, cy - maxR * 0.7); g.lineTo(cx + maxR * 0.7, cy + maxR * 0.7); g.stroke();
+  g.beginPath(); g.moveTo(cx + maxR * 0.7, cy - maxR * 0.7); g.lineTo(cx - maxR * 0.7, cy + maxR * 0.7); g.stroke();
+  g.setLineDash([]);
 
-  // ── Direction labels ──
-  g.fillStyle = 'rgba(61,96,128,0.6)';
+  // Direction labels
+  g.fillStyle = 'rgba(80,120,160,0.5)';
   g.font = '8px "Share Tech Mono"';
   g.textAlign = 'center';
-  g.fillText('PRO', cx, cy - maxR - 6);
-  g.fillText('RETRO', cx, cy + maxR + 14);
-  g.fillText('+R', cx + maxR + 3, cy + 3);
-  g.fillText('-R', cx - maxR - 3, cy + 3);
+  g.fillText('PROGRADE', cx, cy - maxR - 6);
+  g.fillText('RETROGRADE', cx, cy + maxR + 12);
+  g.textAlign = 'right'; g.fillText('+R', cx + maxR + 2, cy - 4);
+  g.textAlign = 'left'; g.fillText('-R', cx - maxR - 12, cy - 4);
   g.textAlign = 'left';
 
-  const sat = state.satellites.find(s => s.id === state.selectedSat);
+  const sat = S.satellites.find(s => s.id === S.selectedSat);
   if (!sat) {
-    // No satellite selected — show placeholder
-    g.fillStyle = 'rgba(61,96,128,0.4)';
-    g.font = '10px "Share Tech Mono"';
+    g.fillStyle = 'rgba(80,120,160,0.3)';
+    g.font = '11px "Share Tech Mono"';
     g.textAlign = 'center';
-    g.fillText('SELECT A SATELLITE', cx, cy - 8);
-    g.fillText('TO VIEW CONJUNCTIONS', cx, cy + 8);
+    g.fillText('SELECT SATELLITE', cx, cy - 6);
+    g.fillText('FOR CONJUNCTIONS', cx, cy + 10);
     g.textAlign = 'left';
-
-    // Satellite dot
-    g.beginPath(); g.arc(cx, cy, 5, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(0,229,255,0.3)'; g.fill();
+    g.beginPath(); g.arc(cx, cy, 4, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(0,229,255,0.2)'; g.fill();
     return;
   }
 
-  // ── Generate nearby debris for the selected satellite ──
-  // In production this comes from the CDM endpoint.
-  // Here we compute proximity from the debris cloud snapshot.
-  const conjunctions = generateConjunctionData(sat);
+  // Plot debris
+  const conjs = getConjunctions(sat);
+  let critCount = 0;
+  for (const c of conjs) {
+    const rf = Math.min(c.tca / 24, 1);
+    const pr = rf * maxR;
+    const a = c.bearing - Math.PI / 2;
+    const px = cx + Math.cos(a) * pr;
+    const py = cy + Math.sin(a) * pr;
 
-  // ── Plot debris markers ──
-  for (const conj of conjunctions) {
-    // r = TCA-based radial distance (closer TCA = smaller r = closer to center)
-    const radiusFrac = Math.min(conj.tca_hours / 24, 1);
-    const plotR = radiusFrac * maxR;
+    let col, sz;
+    if (c.miss < 0.1) { col = '#ff3b52'; sz = 5; critCount++; }
+    else if (c.miss < 1) { col = '#ff7832'; sz = 4; }
+    else if (c.miss < 5) { col = '#ffb830'; sz = 3; }
+    else { col = 'rgba(57,255,122,0.5)'; sz = 2; }
 
-    // Angle = approach bearing (0 = prograde/top)
-    const angle = conj.bearing_rad - Math.PI / 2;
-    const px = cx + Math.cos(angle) * plotR;
-    const py = cy + Math.sin(angle) * plotR;
+    g.beginPath(); g.arc(px, py, sz, 0, Math.PI * 2);
+    g.fillStyle = col;
+    if (c.miss < 1) { g.shadowBlur = 10; g.shadowColor = col; }
+    g.fill(); g.shadowBlur = 0;
 
-    // Color by miss distance
-    let color, glow;
-    if (conj.miss_km < 0.1) {
-      color = 'rgba(255,59,82,1)'; glow = 'rgba(255,59,82,0.6)';
-    } else if (conj.miss_km < 1.0) {
-      color = 'rgba(255,120,50,1)'; glow = 'rgba(255,120,50,0.4)';
-    } else if (conj.miss_km < 5.0) {
-      color = 'rgba(255,184,48,1)'; glow = 'rgba(255,184,48,0.3)';
-    } else {
-      color = 'rgba(57,255,122,0.7)'; glow = 'none';
-    }
-
-    const dotR = conj.miss_km < 0.1 ? 5 : conj.miss_km < 5 ? 3.5 : 2.5;
-
-    if (glow !== 'none') {
-      g.shadowBlur = 8; g.shadowColor = glow;
-    }
-    g.beginPath(); g.arc(px, py, dotR, 0, Math.PI * 2);
-    g.fillStyle = color; g.fill();
-    g.shadowBlur = 0;
-
-    // Label the most critical ones
-    if (conj.miss_km < 1.0) {
-      g.fillStyle = color;
+    if (c.miss < 1) {
+      g.fillStyle = col;
       g.font = '7px "Share Tech Mono"';
-      g.fillText(conj.id.slice(-5), px + 5, py - 3);
+      g.fillText(c.id.slice(-5), px + 6, py - 2);
     }
   }
 
-  // ── Selected satellite at center ──
+  // Center satellite
   g.beginPath(); g.arc(cx, cy, 6, 0, Math.PI * 2);
-  g.fillStyle = 'rgba(0,229,255,0.9)';
-  g.shadowBlur = 14; g.shadowColor = 'rgba(0,229,255,0.7)';
+  g.fillStyle = '#00e5ff'; g.shadowBlur = 18; g.shadowColor = '#00e5ff';
   g.fill(); g.shadowBlur = 0;
-  // Crosshair lines on center dot
-  g.strokeStyle = 'rgba(0,229,255,0.5)';
-  g.lineWidth = 1;
-  g.beginPath(); g.moveTo(cx-10,cy); g.lineTo(cx+10,cy); g.stroke();
-  g.beginPath(); g.moveTo(cx,cy-10); g.lineTo(cx,cy+10); g.stroke();
+  // Inner ring
+  g.beginPath(); g.arc(cx, cy, 9, 0, Math.PI * 2);
+  g.strokeStyle = 'rgba(0,229,255,0.3)'; g.lineWidth = 1; g.stroke();
 
-  // Label
   g.fillStyle = 'rgba(0,229,255,0.8)';
-  g.font = '8px "Share Tech Mono"';
+  g.font = '9px "Share Tech Mono"';
   g.textAlign = 'center';
-  g.fillText(sat.id, cx, cy + 20);
-  g.fillText(`${conjunctions.filter(c=>c.miss_km<0.1).length} CRITICAL`, cx, H - 12);
+  g.fillText(sat.id, cx, cy + 22);
+  if (critCount > 0) {
+    g.fillStyle = '#ff3b52';
+    g.fillText(`${critCount} CRITICAL`, cx, H - 8);
+  }
   g.textAlign = 'left';
 }
 
-function generateConjunctionData(sat) {
-  /**
-   * Synthesize conjunction data from the debris cloud.
-   * We compute a rough angular distance between the satellite's
-   * lat/lon and each debris piece, then classify by proximity.
-   * TCA is estimated from angular separation / orbital velocity.
-   */
-  const results = [];
-  const sample = state.debrisCloud.slice(0, 200); // sample for performance
-
+function getConjunctions(sat) {
+  const res = [];
+  const sample = S.debrisCloud.slice(0, 300);
   for (const d of sample) {
-    const [id, dlat, dlon, dalt] = d;
-    const dlat_diff = dlat - sat.lat;
-    const dlon_diff = dlon - sat.lon;
-    const angDist = Math.sqrt(dlat_diff*dlat_diff + dlon_diff*dlon_diff);
-
-    if (angDist > 15) continue; // Only show relatively nearby debris
-
-    // Rough miss distance estimate (not real physics — just for visualization)
-    const alt_diff = Math.abs((dalt - 550)) * 0.1; // altitude separation
-    const miss_km = angDist * 111 * 0.01 + alt_diff; // very rough
-
-    // Bearing angle
-    const bearing = Math.atan2(dlon_diff, dlat_diff);
-
-    // TCA estimate: debris at ~111km per degree, relative velocity ~1km/s
-    const tca_hours = (angDist * 111) / 3600 + Math.random() * 4;
-
-    results.push({ id, miss_km, bearing_rad: bearing, tca_hours });
+    const dlat = d[1] - sat.lat, dlon = d[2] - sat.lon;
+    const ang = Math.sqrt(dlat * dlat + dlon * dlon);
+    if (ang > 15) continue;
+    const miss = ang * 111 * 0.01 + Math.abs(d[3] - 550) * 0.1;
+    res.push({ id: d[0], miss, bearing: Math.atan2(dlon, dlat), tca: ang * 111 / 3600 + Math.random() * 4 });
   }
-
-  // Sort by miss distance so critical ones render on top
-  return results.sort((a, b) => b.miss_km - a.miss_km);
+  return res.sort((a, b) => b.miss - a.miss);
 }
 
-// Satellite selector
-els.satSelector.addEventListener('change', (e) => {
-  state.selectedSat = e.target.value || null;
-});
+// ═════════════════════════════════════════════════════════════════
+// MODULE 3: FUEL HEATMAP
+// ═════════════════════════════════════════════════════════════════
 
+function drawFuel() {
+  const c = canvas.fuel, g = ctx.fuel;
+  const r = c.getBoundingClientRect();
+  const W = r.width, H = r.height;
 
-// ═══════════════════════════════════════════════════════════════════
-// MODULE 3: FLEET FUEL STATUS HEATMAP
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * Renders a grid of fuel gauges — one per satellite.
- * Each gauge shows:
- *   - Colored bar proportional to fuel remaining
- *   - Color gradient: green → amber → red as fuel depletes
- *   - Satellite ID label
- *
- * This gives operators an at-a-glance view of the fleet's propellant budget.
- */
-
-function drawFuelHeatmap() {
-  const c = canvases.fuel;
-  const g = ctx.fuel;
-  const W = c.width, H = c.height;
-
-  g.fillStyle = '#080f1a';
+  g.fillStyle = '#060c18';
   g.fillRect(0, 0, W, H);
 
-  if (state.satellites.length === 0) return;
+  const n = S.satellites.length;
+  if (!n) {
+    g.fillStyle = 'rgba(80,120,160,0.3)';
+    g.font = '11px "Share Tech Mono"';
+    g.textAlign = 'center';
+    g.fillText('AWAITING FLEET DATA', W / 2, H / 2);
+    g.textAlign = 'left';
+    return;
+  }
 
-  const n = state.satellites.length;
   const cols = Math.ceil(Math.sqrt(n * (W / H)));
   const rows = Math.ceil(n / cols);
-  const cellW = W / cols;
-  const cellH = H / rows;
-  const padding = 3;
-
-  let totalFuel = 0;
-  const INITIAL_FUEL = 50.0;
+  const cw = W / cols, ch = H / rows;
+  const pad = 2;
+  let totalF = 0;
 
   for (let i = 0; i < n; i++) {
-    const sat = state.satellites[i];
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-    const x = col * cellW + padding;
-    const y = row * cellH + padding;
-    const w = cellW - padding * 2;
-    const h = cellH - padding * 2;
+    const sat = S.satellites[i];
+    const col = i % cols, row = Math.floor(i / cols);
+    const x = col * cw + pad, y = row * ch + pad;
+    const w = cw - pad * 2, h = ch - pad * 2;
+    const f = Math.max(0, Math.min(1, sat.fuel_kg / 50));
+    totalF += f;
 
-    const fuelFrac = Math.max(0, Math.min(1, sat.fuel_kg / INITIAL_FUEL));
-    totalFuel += fuelFrac;
-
-    // Cell background
-    g.fillStyle = 'rgba(12,20,32,0.8)';
+    // Cell bg
+    g.fillStyle = 'rgba(10,18,30,0.8)';
     g.fillRect(x, y, w, h);
 
-    // Fuel bar (full height left-to-right fill)
-    const fuelColor = fuelFrac > 0.5
-      ? `rgba(57,255,122,${0.6 + fuelFrac * 0.4})`
-      : fuelFrac > 0.2
-      ? `rgba(255,184,48,${0.7 + fuelFrac * 0.3})`
-      : `rgba(255,59,82,${0.8})`;
+    // Fuel bar
+    const fc = f > 0.5 ? `rgba(57,255,122,${0.5 + f * 0.4})` :
+               f > 0.2 ? `rgba(255,184,48,${0.6 + f * 0.3})` :
+                          `rgba(255,59,82,0.8)`;
+    g.fillStyle = fc;
+    g.fillRect(x, y + h * (1 - f), w, h * f);
 
-    g.fillStyle = fuelColor;
-    g.fillRect(x, y + h * (1 - fuelFrac), w, h * fuelFrac);
-
-    // Status overlay color (top strip)
-    const statusColors = {
-      NOMINAL: 'rgba(57,255,122,0.8)',
-      EVADING: 'rgba(255,184,48,0.8)',
-      RECOVERING: 'rgba(59,139,255,0.8)',
-      EOL: 'rgba(168,85,247,0.8)',
-      DEAD: 'rgba(255,59,82,0.8)',
-    };
-    g.fillStyle = statusColors[sat.status] || 'rgba(57,255,122,0.8)';
+    // Status strip
+    g.fillStyle = statusColor(sat.status);
     g.fillRect(x, y, w, 2);
 
-    // ID label (if cell big enough)
-    if (cellH > 24) {
-      g.fillStyle = 'rgba(255,255,255,0.7)';
-      g.font = `${Math.min(8, cellH * 0.22)}px "Share Tech Mono"`;
-      g.textAlign = 'center';
-      const shortId = sat.id.replace('SAT-', '');
-      g.fillText(shortId, x + w/2, y + h - 3);
-      g.textAlign = 'left';
-    }
-
-    // Fuel % text
-    if (cellH > 38) {
-      g.fillStyle = fuelFrac > 0.2 ? 'rgba(255,255,255,0.9)' : 'rgba(255,59,82,1)';
-      g.font = `bold ${Math.min(10, cellH * 0.28)}px "Share Tech Mono"`;
-      g.textAlign = 'center';
-      g.fillText(`${Math.round(fuelFrac * 100)}%`, x + w/2, y + h/2 + 3);
-      g.textAlign = 'left';
-    }
-
-    // Cell border
-    g.strokeStyle = sat.id === state.selectedSat
-      ? 'rgba(0,229,255,0.7)'
-      : 'rgba(26,45,69,0.5)';
-    g.lineWidth = sat.id === state.selectedSat ? 1.5 : 0.5;
+    // Border
+    g.strokeStyle = sat.id === S.selectedSat ? 'rgba(0,229,255,0.7)' : 'rgba(20,40,60,0.5)';
+    g.lineWidth = sat.id === S.selectedSat ? 1.5 : 0.5;
     g.strokeRect(x, y, w, h);
+
+    // Labels
+    if (ch > 28) {
+      g.fillStyle = f > 0.15 ? 'rgba(255,255,255,0.85)' : '#ff3b52';
+      g.font = `bold ${Math.min(10, ch * 0.25)}px "Share Tech Mono"`;
+      g.textAlign = 'center';
+      g.fillText(`${Math.round(f * 100)}%`, x + w / 2, y + h / 2 + 3);
+      g.textAlign = 'left';
+    }
+    if (ch > 40) {
+      g.fillStyle = 'rgba(200,220,240,0.5)';
+      g.font = `${Math.min(7, ch * 0.16)}px "Share Tech Mono"`;
+      g.textAlign = 'center';
+      g.fillText(sat.id.replace('SAT-', ''), x + w / 2, y + h - 3);
+      g.textAlign = 'left';
+    }
   }
 
-  // Fleet average
-  const avgFuel = (totalFuel / n) * 100;
-  els.fleetFuelAvg.textContent = `AVG: ${avgFuel.toFixed(1)}%`;
-  els.fleetFuelAvg.style.color = avgFuel > 50 ? '#39ff7a' : avgFuel > 20 ? '#ffb830' : '#ff3b52';
+  const avg = (totalF / n) * 100;
+  els.fuelAvg.textContent = `FLEET AVG: ${avg.toFixed(1)}%`;
+  els.fuelAvg.style.color = avg > 50 ? '#39ff7a' : avg > 20 ? '#ffb830' : '#ff3b52';
+  els.fuelBadge.textContent = `${n} SATS`;
 }
 
-
-// ═══════════════════════════════════════════════════════════════════
-// MODULE 4: MANEUVER TIMELINE (Gantt Chart)
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * A horizontal timeline showing past and future burns for each satellite.
- * - X axis = simulation time (scrollable)
- * - Y axis = satellite ID
- * - Blocks: EVASION (amber), RECOVERY (blue), COOLDOWN (dark)
- *
- * Cooldown periods (600s) are shown as hatched grey blocks between burns.
- */
-
-let ganttScrollOffset = 0; // pixels
+// ═════════════════════════════════════════════════════════════════
+// MODULE 4: GANTT TIMELINE
+// ═════════════════════════════════════════════════════════════════
 
 function drawGantt() {
-  const c = canvases.gantt;
-  const g = ctx.gantt;
-  const W = c.width, H = c.height;
+  const c = canvas.gantt, g = ctx.gantt;
+  const r = c.getBoundingClientRect();
+  const W = r.width, H = r.height;
 
-  g.fillStyle = '#060c14';
+  g.fillStyle = '#060c18';
   g.fillRect(0, 0, W, H);
 
-  if (state.maneuverLog.length === 0 && state.satellites.length === 0) return;
-
-  const sats = state.satellites.slice(0, 20); // show first 20
-  const rowH = Math.max(14, (H - 20) / Math.max(sats.length, 1));
-  const labelW = 72;
-  const timelineW = W - labelW;
-
-  // Time window: show 2h around current sim time
-  const windowSec = 7200;
-  const tStart = state.simTimeSec - windowSec * 0.3;
-  const tEnd = tStart + windowSec;
-
-  function timeToX(t) {
-    return labelW + ((t - tStart) / (tEnd - tStart)) * timelineW;
+  const sats = S.satellites.slice(0, 20);
+  if (!sats.length) {
+    g.fillStyle = 'rgba(80,120,160,0.3)';
+    g.font = '11px "Share Tech Mono"';
+    g.textAlign = 'center';
+    g.fillText('AWAITING MANEUVER DATA', W / 2, H / 2);
+    g.textAlign = 'left';
+    return;
   }
 
-  // ── Time axis ──
-  g.strokeStyle = 'rgba(26,45,69,0.6)';
+  const rowH = Math.max(14, (H - 16) / Math.max(sats.length, 1));
+  const labelW = 70;
+  const tlW = W - labelW;
+  const winSec = 7200;
+  const tStart = S.simTimeSec - winSec * 0.3;
+  const tEnd = tStart + winSec;
+
+  const t2x = t => labelW + ((t - tStart) / (tEnd - tStart)) * tlW;
+
+  // Time grid
+  g.strokeStyle = 'rgba(20,40,60,0.4)';
   g.lineWidth = 0.5;
-  const tickIntervalSec = 600; // every 10 min
-  for (let t = Math.ceil(tStart / tickIntervalSec) * tickIntervalSec; t <= tEnd; t += tickIntervalSec) {
-    const x = timeToX(t);
+  for (let t = Math.ceil(tStart / 600) * 600; t <= tEnd; t += 600) {
+    const x = t2x(t);
     g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke();
-    const mins = Math.round(t / 60);
-    g.fillStyle = 'rgba(61,96,128,0.5)';
+    g.fillStyle = 'rgba(60,100,140,0.4)';
     g.font = '7px "Share Tech Mono"';
-    g.fillText(`T+${mins}m`, x + 2, H - 2);
+    g.fillText(`T+${Math.round(t / 60)}m`, x + 2, H - 2);
   }
 
-  // ── "Now" line ──
-  const nowX = timeToX(state.simTimeSec);
+  // NOW line
+  const nx = t2x(S.simTimeSec);
   g.strokeStyle = 'rgba(0,229,255,0.6)';
   g.lineWidth = 1.5;
   g.setLineDash([4, 3]);
-  g.beginPath(); g.moveTo(nowX, 0); g.lineTo(nowX, H - 14); g.stroke();
+  g.beginPath(); g.moveTo(nx, 0); g.lineTo(nx, H - 12); g.stroke();
   g.setLineDash([]);
   g.fillStyle = 'rgba(0,229,255,0.7)';
   g.font = '7px "Share Tech Mono"';
-  g.fillText('NOW', nowX + 2, 10);
+  g.fillText('NOW', nx + 2, 10);
 
-  // ── Rows ──
+  // Rows
+  const burnCol = {
+    EVASION:  { f: 'rgba(255,184,48,0.7)',  s: 'rgba(255,184,48,1)' },
+    RECOVERY: { f: 'rgba(59,139,255,0.7)',   s: 'rgba(59,139,255,1)' },
+    EOL:      { f: 'rgba(168,85,247,0.7)',   s: 'rgba(168,85,247,1)' },
+    MANUAL:   { f: 'rgba(57,255,122,0.6)',   s: 'rgba(57,255,122,1)' },
+  };
+
   for (let i = 0; i < sats.length; i++) {
     const sat = sats[i];
-    const rowY = i * rowH;
+    const ry = i * rowH;
 
-    // Row background
-    g.fillStyle = i % 2 === 0 ? 'rgba(8,15,26,0.8)' : 'rgba(12,20,32,0.6)';
-    g.fillRect(labelW, rowY, timelineW, rowH - 1);
+    // Row bg
+    g.fillStyle = i % 2 === 0 ? 'rgba(8,14,26,0.6)' : 'rgba(12,20,34,0.4)';
+    g.fillRect(labelW, ry, tlW, rowH - 1);
 
-    // Satellite label
-    g.fillStyle = sat.id === state.selectedSat ? 'rgba(0,229,255,0.9)' : 'rgba(100,160,200,0.7)';
-    g.font = `${Math.min(8, rowH * 0.6)}px "Share Tech Mono"`;
+    // Label
+    g.fillStyle = sat.id === S.selectedSat ? 'rgba(0,229,255,0.9)' : 'rgba(100,150,200,0.6)';
+    g.font = `${Math.min(8, rowH * 0.55)}px "Share Tech Mono"`;
     g.textAlign = 'right';
-    g.fillText(sat.id.replace('SAT-', ''), labelW - 4, rowY + rowH * 0.65);
+    g.fillText(sat.id.replace('SAT-', ''), labelW - 4, ry + rowH * 0.65);
     g.textAlign = 'left';
 
-    // Draw maneuver blocks for this satellite
-    const satBurns = state.maneuverLog.filter(b => b.satId === sat.id);
-    for (const burn of satBurns) {
-      const bx = timeToX(burn.startTime);
-      const bw = Math.max(3, timeToX(burn.endTime) - bx);
+    // Burns
+    const burns = S.maneuvers.filter(b => b.satId === sat.id);
+    for (const burn of burns) {
+      const bx = t2x(burn.startTime);
+      const bw = Math.max(3, t2x(burn.endTime) - bx);
+      if (bx > W || bx + bw < labelW) continue;
+      const bc = burnCol[burn.type] || burnCol.MANUAL;
+      g.fillStyle = bc.f;
+      g.fillRect(bx, ry + 1, bw, rowH - 3);
+      g.strokeStyle = bc.s; g.lineWidth = 0.5;
+      g.strokeRect(bx, ry + 1, bw, rowH - 3);
 
-      if (bx > W || bx + bw < labelW) continue; // Off-screen
-
-      const burnColors = {
-        EVASION:  { fill: 'rgba(255,184,48,0.8)',  stroke: 'rgba(255,184,48,1)' },
-        RECOVERY: { fill: 'rgba(59,139,255,0.8)',   stroke: 'rgba(59,139,255,1)' },
-        EOL:      { fill: 'rgba(168,85,247,0.8)',   stroke: 'rgba(168,85,247,1)' },
-        MANUAL:   { fill: 'rgba(57,255,122,0.7)',   stroke: 'rgba(57,255,122,1)' },
-        COOLDOWN: { fill: 'rgba(26,45,69,0.5)',     stroke: 'rgba(26,45,69,0.8)' },
-      };
-      const col = burnColors[burn.type] || burnColors.MANUAL;
-
-      g.fillStyle = col.fill;
-      g.fillRect(bx, rowY + 1, bw, rowH - 3);
-      g.strokeStyle = col.stroke;
-      g.lineWidth = 0.5;
-      g.strokeRect(bx, rowY + 1, bw, rowH - 3);
-
-      // Cooldown block after burn (600s hatched)
-      const cooldownX = bx + bw;
-      const cooldownW = timeToX(burn.endTime + 600) - cooldownX;
-      if (cooldownW > 0 && burn.type !== 'COOLDOWN') {
-        g.save();
-        g.fillStyle = 'rgba(26,45,69,0.4)';
-        g.fillRect(cooldownX, rowY + 1, Math.min(cooldownW, W - cooldownX), rowH - 3);
-        // Hatch pattern
-        g.strokeStyle = 'rgba(26,45,69,0.6)';
-        g.lineWidth = 0.5;
-        for (let hx = cooldownX; hx < cooldownX + cooldownW && hx < W; hx += 4) {
-          g.beginPath();
-          g.moveTo(hx, rowY + 1);
-          g.lineTo(hx - (rowH - 3), rowY + rowH - 2);
-          g.stroke();
-        }
-        g.restore();
+      // Cooldown
+      const cdx = bx + bw;
+      const cdw = t2x(burn.endTime + 600) - cdx;
+      if (cdw > 0) {
+        g.fillStyle = 'rgba(20,35,55,0.4)';
+        g.fillRect(cdx, ry + 1, Math.min(cdw, W - cdx), rowH - 3);
       }
     }
   }
 
-  // Left border
-  g.strokeStyle = 'rgba(26,45,69,0.8)';
-  g.lineWidth = 1;
+  // Divider
+  g.strokeStyle = 'rgba(20,40,60,0.6)'; g.lineWidth = 1;
   g.beginPath(); g.moveTo(labelW, 0); g.lineTo(labelW, H); g.stroke();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// MODULE 5: ΔV EFFICIENCY GRAPH (Fuel vs Collisions Avoided)
-// ═══════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
+// MODULE 5: DELTA-V GRAPH
+// ═════════════════════════════════════════════════════════════════
 
-function drawDVGraph() {
-  const c = canvases.dv;
-  const g = ctx.dv;
-  const W = c.width, H = c.height;
+function drawDV() {
+  const c = canvas.dv, g = ctx.dv;
+  const r = c.getBoundingClientRect();
+  const W = r.width, H = r.height;
 
-  g.fillStyle = '#060c14';
+  g.fillStyle = '#050b14';
   g.fillRect(0, 0, W, H);
 
-  const MARGIN = { top: 12, right: 16, bottom: 28, left: 44 };
-  const plotW = W - MARGIN.left - MARGIN.right;
-  const plotH = H - MARGIN.top - MARGIN.bottom;
+  const M = { t: 8, r: 12, b: 20, l: 40 };
+  const pw = W - M.l - M.r, ph = H - M.t - M.b;
 
-  if (state.dvHistory.length < 2) {
-    g.fillStyle = 'rgba(61,96,128,0.4)';
-    g.font = '9px "Share Tech Mono"';
+  if (S.dvHistory.length < 2) {
+    g.fillStyle = 'rgba(80,120,160,0.3)';
+    g.font = '10px "Share Tech Mono"';
     g.textAlign = 'center';
-    g.fillText('AWAITING DATA...', W/2, H/2);
+    g.fillText('COLLECTING TELEMETRY DATA...', W / 2, H / 2);
     g.textAlign = 'left';
     return;
   }
 
   // Axes
-  g.strokeStyle = 'rgba(26,60,90,0.8)';
-  g.lineWidth = 1;
+  g.strokeStyle = 'rgba(30,60,100,0.6)'; g.lineWidth = 1;
   g.beginPath();
-  g.moveTo(MARGIN.left, MARGIN.top);
-  g.lineTo(MARGIN.left, MARGIN.top + plotH);
-  g.lineTo(MARGIN.left + plotW, MARGIN.top + plotH);
+  g.moveTo(M.l, M.t); g.lineTo(M.l, M.t + ph); g.lineTo(M.l + pw, M.t + ph);
   g.stroke();
 
-  // Labels
-  g.fillStyle = 'rgba(61,96,128,0.7)';
+  g.fillStyle = 'rgba(60,100,140,0.5)';
   g.font = '8px "Share Tech Mono"';
   g.textAlign = 'center';
-  g.fillText('TIME →', MARGIN.left + plotW/2, H - 4);
-  g.save();
-  g.translate(10, MARGIN.top + plotH/2);
-  g.rotate(-Math.PI/2);
-  g.fillText('ΔV kg', 0, 0);
-  g.restore();
+  g.fillText('SIMULATION TIME', M.l + pw / 2, H - 2);
   g.textAlign = 'left';
 
-  const maxFuel = Math.max(...state.dvHistory.map(d => d.fuel_used), 1);
-  const maxTime = state.dvHistory.length;
+  const maxF = Math.max(...S.dvHistory.map(d => d.fuel), 1);
+  const n = S.dvHistory.length;
+  const pt = (i, v, mv) => [M.l + (i / (n - 1)) * pw, M.t + ph - (v / mv) * ph];
 
-  function toXY(i, val, maxVal) {
-    const x = MARGIN.left + (i / (maxTime - 1)) * plotW;
-    const y = MARGIN.top + plotH - (val / maxVal) * plotH;
-    return [x, y];
-  }
-
-  // Fuel consumed line (amber)
-  g.strokeStyle = 'rgba(255,184,48,0.8)';
-  g.lineWidth = 1.5;
+  // Fuel line (amber)
+  g.strokeStyle = 'rgba(255,184,48,0.8)'; g.lineWidth = 1.5;
   g.beginPath();
-  state.dvHistory.forEach((d, i) => {
-    const [x, y] = toXY(i, d.fuel_used, maxFuel);
-    i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
-  });
+  S.dvHistory.forEach((d, i) => { const [x, y] = pt(i, d.fuel, maxF); i === 0 ? g.moveTo(x, y) : g.lineTo(x, y); });
   g.stroke();
 
-  // Area fill under fuel line
+  // Area fill
   g.save();
-  const lastPt = toXY(state.dvHistory.length - 1, state.dvHistory[state.dvHistory.length-1].fuel_used, maxFuel);
-  const firstPt = toXY(0, state.dvHistory[0].fuel_used, maxFuel);
-  g.lineTo(lastPt[0], MARGIN.top + plotH);
-  g.lineTo(firstPt[0], MARGIN.top + plotH);
-  g.closePath();
-  g.fillStyle = 'rgba(255,184,48,0.06)';
-  g.fill();
+  const last = pt(n - 1, S.dvHistory[n - 1].fuel, maxF);
+  const first = pt(0, S.dvHistory[0].fuel, maxF);
+  g.lineTo(last[0], M.t + ph); g.lineTo(first[0], M.t + ph); g.closePath();
+  const grad = g.createLinearGradient(0, M.t, 0, M.t + ph);
+  grad.addColorStop(0, 'rgba(255,184,48,0.12)');
+  grad.addColorStop(1, 'rgba(255,184,48,0)');
+  g.fillStyle = grad; g.fill();
   g.restore();
 
-  // Collisions avoided line (green — if we have it)
-  const maxAvoid = Math.max(...state.dvHistory.map(d => d.collisions_avoided), 1);
-  if (maxAvoid > 0) {
-    g.strokeStyle = 'rgba(57,255,122,0.7)';
-    g.lineWidth = 1.5;
+  // Collisions avoided (green)
+  const maxA = Math.max(...S.dvHistory.map(d => d.avoided), 1);
+  if (maxA > 0) {
+    g.strokeStyle = 'rgba(57,255,122,0.7)'; g.lineWidth = 1.5;
     g.beginPath();
-    state.dvHistory.forEach((d, i) => {
-      const [x, y] = toXY(i, d.collisions_avoided, maxAvoid);
-      i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
-    });
+    S.dvHistory.forEach((d, i) => { const [x, y] = pt(i, d.avoided, maxA); i === 0 ? g.moveTo(x, y) : g.lineTo(x, y); });
     g.stroke();
   }
 
   // Legend
-  g.fillStyle = 'rgba(255,184,48,0.8)'; g.fillRect(MARGIN.left, MARGIN.top + 2, 12, 2);
+  g.fillStyle = 'rgba(255,184,48,0.8)'; g.fillRect(M.l + 5, M.t + 2, 14, 2);
   g.fillStyle = 'rgba(255,184,48,0.7)'; g.font = '7px "Share Tech Mono"';
-  g.fillText('Fuel kg', MARGIN.left + 15, MARGIN.top + 6);
-
-  g.fillStyle = 'rgba(57,255,122,0.8)'; g.fillRect(MARGIN.left + 55, MARGIN.top + 2, 12, 2);
+  g.fillText('FUEL USED', M.l + 22, M.t + 6);
+  g.fillStyle = 'rgba(57,255,122,0.8)'; g.fillRect(M.l + 85, M.t + 2, 14, 2);
   g.fillStyle = 'rgba(57,255,122,0.7)';
-  g.fillText('Avoided', MARGIN.left + 70, MARGIN.top + 6);
+  g.fillText('AVOIDED', M.l + 102, M.t + 6);
 }
 
-
-// ═══════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 // API POLLING
-// ═══════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════
 
-async function fetchSnapshot() {
+async function poll() {
   try {
     const resp = await fetch(`${API_BASE}/api/visualization/snapshot`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-
-    // Update satellite list
-    state.satellites = data.satellites || [];
-    state.debrisCloud = data.debris_cloud || [];
-
-    // Update trail history (keep last 90 minutes = ~90 positions at 60s intervals)
-    for (const sat of state.satellites) {
-      if (!state.trailHistory[sat.id]) state.trailHistory[sat.id] = [];
-      state.trailHistory[sat.id].push({ lat: sat.lat, lon: sat.lon });
-      if (state.trailHistory[sat.id].length > 90) {
-        state.trailHistory[sat.id].shift();
-      }
-    }
-
-    // Update selector
-    updateSatSelector();
-
-    // Update stats
-    els.statSatCount.textContent = state.satellites.length;
-    els.statDebrisCount.textContent = state.debrisCloud.length;
-
-    // Use authoritative sim time from backend if available
-    if (data.sim_time_s !== undefined) {
-      state.simTimeSec = data.sim_time_s;
-    } else {
-      state.simTimeSec += POLL_INTERVAL_MS / 1000;
-    }
-    updateClocks();
-
-    // Mark connected
-    setConnected(true);
-
-    // Check for critical fuel
-    const criticalSats = state.satellites.filter(s => s.fuel_kg < 2.5);
-    if (criticalSats.length > 0) {
-      showAlert(`FUEL CRITICAL: ${criticalSats.map(s=>s.id).join(', ')}`);
-    }
-
-    return true;
-  } catch (err) {
-    setConnected(false);
-    return false;
-  }
-}
-
-async function fetchHealth() {
-  try {
-    const resp = await fetch(`${API_BASE}/health`);
     if (!resp.ok) throw new Error();
     const data = await resp.json();
-    els.statCDMCount.textContent = data.active_cdms || 0;
 
-    if ((data.active_cdms || 0) > 0) {
-      document.getElementById('statCDM').classList.add('alert');
+    S.satellites = data.satellites || [];
+    S.debrisCloud = data.debris_cloud || [];
+    S.simTimeSec = data.sim_time_s ?? S.simTimeSec + POLL_MS / 1000;
+
+    // Update trails
+    for (const sat of S.satellites) {
+      if (!S.trails[sat.id]) S.trails[sat.id] = [];
+      S.trails[sat.id].push({ lat: sat.lat, lon: sat.lon });
+      if (S.trails[sat.id].length > 90) S.trails[sat.id].shift();
     }
 
-    // Add ΔV history point
-    if (state.dvHistory.length === 0 || state.simTimeSec % 30 < 2) {
-      const prevFuel = state.dvHistory.length > 0
-        ? state.dvHistory[state.dvHistory.length - 1].fuel_used
-        : 0;
-      const totalFuelLeft = (state.satellites.reduce((sum, s) => sum + s.fuel_kg, 0));
-      const totalFuelUsed = state.satellites.length * 50 - totalFuelLeft;
-      state.dvHistory.push({
-        fuel_used: Math.max(0, totalFuelUsed),
-        collisions_avoided: data.total_collisions || 0,
-        t: state.simTimeSec
-      });
-      if (state.dvHistory.length > 60) state.dvHistory.shift();
-    }
+    updateUI(true);
+    updateSelector();
+  } catch {
+    updateUI(false);
+  }
 
-    // Inject some demo maneuver data so the Gantt isn't empty on load
-    if (state.maneuverLog.length === 0 && state.satellites.length > 0) {
-      seedDemoManeuvers();
-    }
+  try {
+    const hr = await fetch(`${API_BASE}/health`);
+    if (hr.ok) {
+      const hd = await hr.json();
+      els.cdmCount.textContent = hd.active_cdms || 0;
 
+      // DV history
+      const totalFuelLeft = S.satellites.reduce((s, sat) => s + sat.fuel_kg, 0);
+      const totalUsed = S.satellites.length * 50 - totalFuelLeft;
+      S.dvHistory.push({ fuel: Math.max(0, totalUsed), avoided: hd.total_collisions || 0, t: S.simTimeSec });
+      if (S.dvHistory.length > 80) S.dvHistory.shift();
+      els.dvBadge.textContent = `${totalUsed.toFixed(1)} kg`;
+    }
   } catch {}
+
+  // Seed maneuvers for gantt
+  if (S.maneuvers.length === 0 && S.satellites.length > 0) seedManeuvers();
 }
 
-function seedDemoManeuvers() {
+function seedManeuvers() {
   const types = ['EVASION', 'RECOVERY', 'MANUAL'];
-  for (let i = 0; i < Math.min(state.satellites.length, 15); i++) {
-    const sat = state.satellites[i];
-    const offset = (Math.random() - 0.3) * 3600;
-    state.maneuverLog.push({
-      satId: sat.id,
-      burnId: `BURN_${i}`,
-      startTime: state.simTimeSec + offset,
-      endTime: state.simTimeSec + offset + 60 + Math.random() * 120,
+  for (let i = 0; i < Math.min(S.satellites.length, 15); i++) {
+    const sat = S.satellites[i];
+    const off = (Math.random() - 0.3) * 3600;
+    S.maneuvers.push({
+      satId: sat.id, burnId: `B${i}`,
+      startTime: S.simTimeSec + off,
+      endTime: S.simTimeSec + off + 60 + Math.random() * 120,
       type: types[i % 3],
     });
   }
 }
 
-function updateSatSelector() {
-  const current = els.satSelector.value;
-  els.satSelector.innerHTML = '<option value="">— SELECT SAT —</option>';
-  for (const sat of state.satellites) {
-    const opt = document.createElement('option');
-    opt.value = sat.id;
-    opt.textContent = sat.id;
-    if (sat.status !== 'NOMINAL') opt.textContent += ` [${sat.status}]`;
-    els.satSelector.appendChild(opt);
-  }
-  if (current) els.satSelector.value = current;
+function updateUI(online) {
+  S.connected = online;
+  els.connBadge.className = `conn-badge ${online ? 'online' : 'offline'}`;
+  els.connLabel.textContent = online ? 'LIVE' : 'OFFLINE';
+  els.satCount.textContent = S.satellites.length;
+  els.debCount.textContent = S.debrisCloud.length;
 
-  // Auto-select first satellite if none selected
-  if (!state.selectedSat && state.satellites.length > 0) {
-    state.selectedSat = state.satellites[0].id;
-    els.satSelector.value = state.selectedSat;
-  }
+  els.simClock.textContent = formatTime(S.simTimeSec);
+  const d = new Date(S.epoch.getTime() + S.simTimeSec * 1000);
+  els.epochClock.textContent = d.toISOString().replace('T', ' ').slice(0, 19);
+
+  // Fuel alert
+  const crit = S.satellites.filter(s => s.fuel_kg < 2.5);
+  if (crit.length > 0) showAlert(`FUEL CRITICAL: ${crit.map(s => s.id).join(', ')}`);
 }
 
-function updateClocks() {
-  const h = Math.floor(state.simTimeSec / 3600);
-  const m = Math.floor((state.simTimeSec % 3600) / 60);
-  const s = Math.floor(state.simTimeSec % 60);
-  els.simClock.textContent = `T+${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-
-  const epoch = new Date(state.epochDate.getTime() + state.simTimeSec * 1000);
-  els.epochClock.textContent = epoch.toISOString().replace('T',' ').slice(0,19);
-}
-
-function setConnected(online) {
-  state.isConnected = online;
-  els.connDot.classList.toggle('online', online);
-  els.connLabel.textContent = online ? 'ONLINE' : 'OFFLINE';
+function updateSelector() {
+  const cur = els.selector.value;
+  els.selector.innerHTML = '<option value="">-- SELECT SATELLITE --</option>';
+  for (const sat of S.satellites) {
+    const o = document.createElement('option');
+    o.value = sat.id;
+    o.textContent = sat.id + (sat.status !== 'NOMINAL' ? ` [${sat.status}]` : '');
+    els.selector.appendChild(o);
+  }
+  if (cur) els.selector.value = cur;
+  if (!S.selectedSat && S.satellites.length > 0) {
+    S.selectedSat = S.satellites[0].id;
+    els.selector.value = S.selectedSat;
+  }
 }
 
 function showAlert(msg) {
   els.alertText.textContent = msg;
-  els.alertBanner.classList.remove('hidden');
-  setTimeout(() => els.alertBanner.classList.add('hidden'), 5000);
+  els.alert.classList.add('visible');
+  setTimeout(() => els.alert.classList.remove('visible'), 5000);
 }
 
+// ─── Demo Data (offline mode) ────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════
-// RENDER LOOP (60 FPS via requestAnimationFrame)
-// ═══════════════════════════════════════════════════════════════════
-
-function renderFrame() {
-  drawGroundTrack();
-  drawBullseye();
-  drawFuelHeatmap();
-  drawGantt();
-  drawDVGraph();
-  requestAnimationFrame(renderFrame);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════
-// INIT
-// ═══════════════════════════════════════════════════════════════════
-
-async function init() {
-  resizeAll();
-
-  // Try to connect to API
-  const connected = await fetchSnapshot();
-  await fetchHealth();
-
-  if (!connected) {
-    // Load demo data so the dashboard looks alive without an API
-    console.warn('API not reachable — loading demo data');
-    loadDemoData();
-  }
-
-  // Poll API every 2 seconds
-  setInterval(async () => {
-    await fetchSnapshot();
-    await fetchHealth();
-  }, POLL_INTERVAL_MS);
-
-  // Start render loop
-  requestAnimationFrame(renderFrame);
-}
-
-function loadDemoData() {
-  /**
-   * Generates a realistic-looking demo dataset so the dashboard
-   * renders properly even before the backend is running.
-   * This is useful during frontend development.
-   */
-  const statuses = ['NOMINAL','NOMINAL','NOMINAL','EVADING','RECOVERING','EOL'];
+function loadDemo() {
+  const statuses = ['NOMINAL', 'NOMINAL', 'NOMINAL', 'EVADING', 'RECOVERING'];
   for (let i = 0; i < 50; i++) {
-    const plane = Math.floor(i / 10);
-    const slot = i % 10;
-    const lat = Math.sin(plane * 1.256 + slot * 0.628) * 53;
-    const lon = ((plane * 72 + slot * 36 + state.simTimeSec * 0.004) % 360) - 180;
-    state.satellites.push({
-      id: `SAT-P${plane+1}-${String(slot+1).padStart(2,'0')}`,
-      lat, lon,
+    const p = Math.floor(i / 10), sl = i % 10;
+    S.satellites.push({
+      id: `SAT-P${p + 1}-${String(sl + 1).padStart(2, '0')}`,
+      lat: Math.sin(p * 1.256 + sl * 0.628) * 53,
+      lon: ((p * 72 + sl * 36) % 360) - 180,
       fuel_kg: 50 - Math.random() * 15,
       status: statuses[Math.floor(Math.random() * statuses.length)],
     });
   }
-
   for (let i = 0; i < 2000; i++) {
-    const lat = (Math.random() - 0.5) * 160;
-    const lon = (Math.random() - 0.5) * 360;
-    const alt = 400 + Math.random() * 400;
-    state.debrisCloud.push([`DEB-${String(i).padStart(5,'0')}`, lat, lon, alt]);
+    S.debrisCloud.push([`DEB-${String(i).padStart(5, '0')}`, (Math.random() - 0.5) * 160, (Math.random() - 0.5) * 360, 400 + Math.random() * 400]);
   }
-
-  updateSatSelector();
-  seedDemoManeuvers();
-
-  // Seed ΔV history
   for (let i = 0; i < 30; i++) {
-    state.dvHistory.push({
-      fuel_used: i * 0.08 + Math.random() * 0.2,
-      collisions_avoided: Math.floor(i * 0.3),
-      t: i * 60
-    });
+    S.dvHistory.push({ fuel: i * 0.08 + Math.random() * 0.2, avoided: Math.floor(i * 0.3), t: i * 60 });
   }
-
-  els.statSatCount.textContent = state.satellites.length;
-  els.statDebrisCount.textContent = state.debrisCloud.length;
-  els.statCDMCount.textContent = Math.floor(Math.random() * 5);
-  setConnected(false);
+  updateSelector();
+  seedManeuvers();
+  updateUI(false);
 }
 
-// Animate demo satellites even without API
-setInterval(() => {
-  if (!state.isConnected) {
-    for (const sat of state.satellites) {
-      sat.lon = ((sat.lon + 0.12) % 360 + 360) % 360;
-      if (sat.lon > 180) sat.lon -= 360;
-      sat.lat += (Math.random() - 0.5) * 0.02;
-      if (!state.trailHistory[sat.id]) state.trailHistory[sat.id] = [];
-      state.trailHistory[sat.id].push({ lat: sat.lat, lon: sat.lon });
-      if (state.trailHistory[sat.id].length > 90) state.trailHistory[sat.id].shift();
+// ─── Interactions ────────────────────────────────────────────────
+
+els.selector.addEventListener('change', e => { S.selectedSat = e.target.value || null; });
+
+$('btnToggleTrails').addEventListener('click', function () {
+  S.showTrails = !S.showTrails;
+  this.classList.toggle('active', S.showTrails);
+});
+$('btnToggleTerminator').addEventListener('click', function () {
+  S.showTerminator = !S.showTerminator;
+  this.classList.toggle('active', S.showTerminator);
+});
+$('btnToggleDebrisMap').addEventListener('click', function () {
+  S.showDebris = !S.showDebris;
+  this.classList.toggle('active', S.showDebris);
+});
+
+// Map tooltip & click
+canvas.groundTrack.addEventListener('mousemove', e => {
+  const rect = canvas.groundTrack.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const W = rect.width, H = rect.height;
+
+  let hit = null;
+  for (const sat of S.satellites) {
+    const [sx, sy] = ll2xy(sat.lat, sat.lon, W, H);
+    if (Math.hypot(mx - sx, my - sy) < 10) { hit = sat; break; }
+  }
+
+  if (hit) {
+    els.tooltip.style.display = 'block';
+    els.tooltip.style.left = (e.clientX + 14) + 'px';
+    els.tooltip.style.top = (e.clientY - 10) + 'px';
+    els.tooltip.innerHTML =
+      `<b style="color:#00e5ff">${hit.id}</b><br>` +
+      `LAT ${hit.lat.toFixed(2)}° LON ${hit.lon.toFixed(2)}°<br>` +
+      `FUEL ${hit.fuel_kg.toFixed(1)} kg<br>` +
+      `<span style="color:${statusColor(hit.status)}">${hit.status}</span>`;
+  } else {
+    els.tooltip.style.display = 'none';
+  }
+});
+
+canvas.groundTrack.addEventListener('click', e => {
+  const rect = canvas.groundTrack.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const W = rect.width, H = rect.height;
+  for (const sat of S.satellites) {
+    const [sx, sy] = ll2xy(sat.lat, sat.lon, W, H);
+    if (Math.hypot(mx - sx, my - sy) < 12) {
+      S.selectedSat = sat.id;
+      els.selector.value = sat.id;
+      break;
     }
-    state.simTimeSec += 30;
-    updateClocks();
+  }
+});
+
+// Demo animation (when offline)
+setInterval(() => {
+  if (!S.connected && S.satellites.length > 0) {
+    for (const sat of S.satellites) {
+      sat.lon = ((sat.lon + 0.15 + 360) % 360);
+      if (sat.lon > 180) sat.lon -= 360;
+      sat.lat += (Math.random() - 0.5) * 0.03;
+      if (!S.trails[sat.id]) S.trails[sat.id] = [];
+      S.trails[sat.id].push({ lat: sat.lat, lon: sat.lon });
+      if (S.trails[sat.id].length > 90) S.trails[sat.id].shift();
+    }
+    S.simTimeSec += 30;
+    updateUI(false);
   }
 }, 500);
 
-// Start
+// ═════════════════════════════════════════════════════════════════
+// RENDER LOOP (60 FPS)
+// ═════════════════════════════════════════════════════════════════
+
+function render() {
+  resize();
+  drawMap();
+  drawBullseye();
+  drawFuel();
+  drawGantt();
+  drawDV();
+  requestAnimationFrame(render);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// INIT
+// ═════════════════════════════════════════════════════════════════
+
+async function init() {
+  resize();
+  const ok = await poll().then(() => S.connected).catch(() => false);
+  if (!S.connected) {
+    console.warn('API offline — loading demo data');
+    loadDemo();
+  }
+  setInterval(poll, POLL_MS);
+  requestAnimationFrame(render);
+}
+
 init();

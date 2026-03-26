@@ -1,186 +1,439 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>🚀 Orbital Insight Dashboard</title>
-
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ORBITAL INSIGHT | ACM Mission Control</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Inter:wght@300;400;500;600&family=Share+Tech+Mono&display=swap" rel="stylesheet">
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&family=Inter:wght@300;400;600&family=Share+Tech+Mono&display=swap');
-        
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg-primary: #030711;
+            --bg-panel: rgba(8, 14, 28, 0.85);
+            --bg-card: rgba(12, 20, 38, 0.7);
+            --border-subtle: rgba(0, 229, 255, 0.12);
+            --border-glow: rgba(0, 229, 255, 0.35);
+            --cyan: #00e5ff;
+            --green: #39ff7a;
+            --amber: #ffb830;
+            --red: #ff3b52;
+            --purple: #a855f7;
+            --blue: #3b8bff;
+            --text-primary: #e2e8f0;
+            --text-muted: rgba(120, 160, 200, 0.7);
+        }
+
         body {
-            margin: 0;
-            background: radial-gradient(circle at 50% -20%, #0a1738, #01050a 80%);
-            color: #e2e8f0;
-            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: 'Inter', -apple-system, sans-serif;
             overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
         }
 
-        header {
+        /* ── HEADER ────────────────────────────────── */
+        .header {
             display: flex;
+            align-items: center;
             justify-content: space-between;
-            align-items: center;
-            padding: 10px 20px;
-            background: rgba(10, 17, 40, 0.85);
-            backdrop-filter: blur(10px);
-            border-bottom: 1px solid rgba(0,229,255,0.3);
-            font-family: 'Orbitron', sans-serif;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-            z-index: 10;
+            padding: 0 20px;
+            height: 52px;
+            background: linear-gradient(180deg, rgba(8,15,30,0.95), rgba(5,10,20,0.9));
+            border-bottom: 1px solid var(--border-subtle);
+            backdrop-filter: blur(20px);
+            flex-shrink: 0;
+            z-index: 100;
         }
 
-        header div {
+        .header-brand {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
         }
 
-        #connDot.online {
-            color: #00ff96;
+        .header-brand .logo {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            box-shadow: 0 0 12px rgba(0,229,255,0.3);
         }
 
-        #connDot {
-            color: red;
+        .header-brand h1 {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 3px;
+            background: linear-gradient(90deg, var(--cyan), #80f0ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
 
-        select, button {
-            background: linear-gradient(145deg, #0b1529, #050a14);
-            color: #00e5ff;
-            border: 1px solid rgba(0,229,255,0.4);
-            padding: 6px 12px;
-            border-radius: 6px;
-            font-family: 'Inter', sans-serif;
+        .header-stats {
+            display: flex;
+            gap: 24px;
+            align-items: center;
+        }
+
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+        }
+
+        .stat-item .stat-label {
+            color: var(--text-muted);
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .stat-item .stat-value {
+            font-size: 16px;
             font-weight: 600;
-            transition: all 0.3s ease;
-        }
-        button:hover {
-            background: #00e5ff;
-            color: #01050a;
-            box-shadow: 0 0 10px rgba(0,229,255,0.6);
+            font-family: 'Orbitron', sans-serif;
         }
 
-        button {
+        .stat-value.sats { color: var(--cyan); }
+        .stat-value.debris { color: var(--amber); }
+        .stat-value.cdms { color: var(--red); }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .conn-badge {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 10px;
+            font-family: 'Share Tech Mono', monospace;
+            letter-spacing: 1px;
+        }
+        .conn-badge.online {
+            background: rgba(57,255,122,0.1);
+            border: 1px solid rgba(57,255,122,0.3);
+            color: var(--green);
+        }
+        .conn-badge.offline {
+            background: rgba(255,59,82,0.1);
+            border: 1px solid rgba(255,59,82,0.3);
+            color: var(--red);
+        }
+        .conn-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+        .conn-badge.online .conn-dot { background: var(--green); }
+        .conn-badge.offline .conn-dot { background: var(--red); }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        select {
+            background: rgba(12,20,38,0.8);
+            color: var(--cyan);
+            border: 1px solid var(--border-glow);
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            outline: none;
             cursor: pointer;
         }
 
-        .controls {
+        /* ── CLOCK BAR ─────────────────────────────── */
+        .clock-bar {
             display: flex;
-            gap: 12px;
-            padding: 10px 20px;
-            background: rgba(5, 13, 24, 0.7);
-            border-bottom: 1px solid rgba(0,229,255,0.15);
-            backdrop-filter: blur(5px);
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            height: 32px;
+            background: rgba(5, 10, 20, 0.6);
+            border-bottom: 1px solid var(--border-subtle);
+            flex-shrink: 0;
         }
 
-        .grid {
+        .clock-left, .clock-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .clock-item {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+        .clock-item span {
+            color: var(--cyan);
+            margin-left: 4px;
+        }
+
+        .controls-group {
+            display: flex;
+            gap: 4px;
+        }
+
+        .ctrl-btn {
+            background: rgba(12,20,38,0.6);
+            border: 1px solid rgba(0,229,255,0.15);
+            color: var(--text-muted);
+            padding: 3px 10px;
+            border-radius: 3px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 1px;
+            cursor: pointer;
+            text-transform: uppercase;
+            transition: all 0.2s;
+        }
+        .ctrl-btn:hover, .ctrl-btn.active {
+            background: rgba(0,229,255,0.1);
+            border-color: var(--border-glow);
+            color: var(--cyan);
+        }
+
+        /* ── MAIN GRID ─────────────────────────────── */
+        .main-grid {
             display: grid;
-            grid-template-columns: 2fr 1fr;
-            grid-template-rows: 1fr 1fr;
-            gap: 8px;
-            height: calc(100vh - 110px);
-            padding: 8px;
+            grid-template-columns: 2.2fr 1fr;
+            grid-template-rows: 1.3fr 1fr;
+            gap: 6px;
+            padding: 6px;
+            flex: 1;
+            min-height: 0;
         }
 
-        canvas {
-            width: 100%;
-            height: 100%;
-            display: block;
-            background: #01050a;
-            border: 1px solid rgba(0,255,150,0.15);
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
             border-radius: 6px;
-            box-shadow: 0 0 20px rgba(0,255,150,0.05);
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
 
-        #dvCanvas {
-            height: 150px;
-            margin: 0 8px 8px 8px;
-        }
-
-        #fleetFuelAvg {
+        .panel::before {
+            content: '';
             position: absolute;
-            bottom: 10px;
-            left: 15px;
-            font-size: 14px;
-            font-weight: bold;
+            top: 0; left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(0,229,255,0.2), transparent);
         }
 
-        #alertBanner {
-            position: absolute;
-            top: 60px;
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 12px;
+            border-bottom: 1px solid rgba(0,229,255,0.06);
+            flex-shrink: 0;
+        }
+
+        .panel-title {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 9px;
+            font-weight: 500;
+            letter-spacing: 2px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .panel-badge {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: rgba(0,229,255,0.08);
+            border: 1px solid rgba(0,229,255,0.15);
+            color: var(--cyan);
+        }
+
+        .panel canvas {
+            flex: 1;
+            width: 100%;
+            display: block;
+        }
+
+        /* ── BOTTOM STRIP ──────────────────────────── */
+        .bottom-strip {
+            height: 120px;
+            padding: 0 6px 6px;
+            flex-shrink: 0;
+        }
+
+        .bottom-strip .panel {
+            height: 100%;
+        }
+
+        /* ── ALERT BANNER ──────────────────────────── */
+        .alert-banner {
+            position: fixed;
+            top: 56px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(255,50,50,0.9);
-            padding: 6px 12px;
+            background: linear-gradient(90deg, rgba(255,59,82,0.9), rgba(200,30,50,0.9));
+            padding: 6px 20px;
             border-radius: 4px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
             color: white;
+            z-index: 200;
+            box-shadow: 0 4px 20px rgba(255,59,82,0.3);
+            display: none;
         }
+        .alert-banner.visible { display: block; }
 
-        .hidden {
+        /* ── TOOLTIP ────────────────────────────────── */
+        .tooltip {
+            position: fixed;
+            background: rgba(8,14,28,0.95);
+            border: 1px solid var(--border-glow);
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            line-height: 1.6;
+            pointer-events: none;
+            z-index: 300;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
             display: none;
         }
 
-        #mapTooltip {
+        .fleet-avg {
+            position: fixed;
+            bottom: 135px;
+            left: 20px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+            z-index: 50;
+        }
+
+        /* ── SCANLINE ANIMATION ────────────────────── */
+        .panel::after {
+            content: '';
             position: absolute;
-            background: rgba(0,0,0,0.8);
-            padding: 5px 8px;
-            border: 1px solid #00ff96;
-            border-radius: 4px;
-            font-size: 11px;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, rgba(0,229,255,0.15), transparent);
+            animation: scanline 8s linear infinite;
             pointer-events: none;
+        }
+        @keyframes scanline {
+            0% { top: 0; }
+            100% { top: 100%; }
         }
     </style>
 </head>
-
 <body>
 
-<header>
-    <div>
-        ⏱ <span id="simClock">T+00:00:00</span>
-        📅 <span id="epochClock"></span>
+<!-- HEADER -->
+<div class="header">
+    <div class="header-brand">
+        <div class="logo">O</div>
+        <h1>ORBITAL INSIGHT</h1>
     </div>
-
-    <div>
-        🛰 <span id="statSatCount">0</span>
-        ☄️ <span id="statDebrisCount">0</span>
-        ⚠️ <span id="statCDMCount">0</span>
+    <div class="header-stats">
+        <div class="stat-item">
+            <div><div class="stat-label">SATELLITES</div><div class="stat-value sats" id="statSatCount">0</div></div>
+        </div>
+        <div class="stat-item">
+            <div><div class="stat-label">DEBRIS</div><div class="stat-value debris" id="statDebrisCount">0</div></div>
+        </div>
+        <div class="stat-item">
+            <div><div class="stat-label">CDM ALERTS</div><div class="stat-value cdms" id="statCDMCount">0</div></div>
+        </div>
     </div>
-
-    <div>
-        <span id="connDot">●</span>
-        <span id="connLabel">OFFLINE</span>
+    <div class="header-right">
+        <select id="satSelector"><option value="">-- SELECT SATELLITE --</option></select>
+        <div class="conn-badge offline" id="connBadge">
+            <div class="conn-dot"></div>
+            <span id="connLabel">OFFLINE</span>
+        </div>
     </div>
-
-    <div>
-        <select id="satSelector"></select>
-    </div>
-</header>
-
-<!-- Controls -->
-<div class="controls">
-    <button id="btnToggleTrails">Trails</button>
-    <button id="btnToggleTerminator">Terminator</button>
-    <button id="btnToggleDebrisMap">Debris</button>
 </div>
 
-<!-- Main Grid -->
-<div class="grid">
-    <canvas id="groundTrackCanvas"></canvas>
-    <canvas id="bullseyeCanvas"></canvas>
-    <canvas id="fuelCanvas"></canvas>
-    <canvas id="ganttCanvas"></canvas>
+<!-- CLOCK BAR -->
+<div class="clock-bar">
+    <div class="clock-left">
+        <div class="clock-item">MET<span id="simClock">T+00:00:00</span></div>
+        <div class="clock-item">UTC<span id="epochClock">--</span></div>
+    </div>
+    <div class="controls-group">
+        <button class="ctrl-btn active" id="btnToggleTrails">TRAILS</button>
+        <button class="ctrl-btn active" id="btnToggleTerminator">TERMINATOR</button>
+        <button class="ctrl-btn active" id="btnToggleDebrisMap">DEBRIS</button>
+    </div>
 </div>
 
-<!-- Bottom Graph -->
-<canvas id="dvCanvas"></canvas>
-
-<!-- UI Elements -->
-<div id="alertBanner" class="hidden">
-    <span id="alertText"></span>
+<!-- MAIN GRID -->
+<div class="main-grid">
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Ground Track - Mercator</span>
+            <span class="panel-badge">LIVE</span>
+        </div>
+        <canvas id="groundTrackCanvas"></canvas>
+    </div>
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Conjunction Bullseye</span>
+            <span class="panel-badge" id="bullseyeBadge">24H</span>
+        </div>
+        <canvas id="bullseyeCanvas"></canvas>
+    </div>
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Fleet Fuel Status</span>
+            <span class="panel-badge" id="fuelBadge">50 SATS</span>
+        </div>
+        <canvas id="fuelCanvas"></canvas>
+    </div>
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Maneuver Timeline</span>
+            <span class="panel-badge">GANTT</span>
+        </div>
+        <canvas id="ganttCanvas"></canvas>
+    </div>
 </div>
 
-<div id="mapTooltip" class="hidden"></div>
+<!-- BOTTOM STRIP -->
+<div class="bottom-strip">
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Delta-V Efficiency</span>
+            <span class="panel-badge" id="dvBadge">0 m/s</span>
+        </div>
+        <canvas id="dvCanvas"></canvas>
+    </div>
+</div>
 
-<div id="fleetFuelAvg"></div>
+<!-- OVERLAYS -->
+<div class="alert-banner" id="alertBanner"><span id="alertText"></span></div>
+<div class="tooltip" id="mapTooltip"></div>
+<div class="fleet-avg" id="fleetFuelAvg"></div>
 
 <script src="/static/dashboard.js"></script>
-
 </body>
 </html>
